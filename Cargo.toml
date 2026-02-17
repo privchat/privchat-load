@@ -1,0 +1,27 @@
+[package]
+name = "privchat-load"
+version = "0.1.0"
+edition = "2021"
+authors = ["PrivChat Team"]
+description = "PrivChat 压测工具：可配置用户数、场景与速率，data/ 持久化账号 token"
+
+[workspace]
+
+[[bin]]
+name = "privchat-load"
+path = "src/main.rs"
+
+[dependencies]
+privchat-sdk = { path = "../privchat-rust/crates/privchat-sdk" }
+privchat-protocol = { path = "../privchat-protocol" }
+
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.0", features = ["v4", "v5"] }
+chrono = "0.4"
+toml = "0.8"
+hdrhistogram = "7"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
