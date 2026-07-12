@@ -72,6 +72,10 @@ pub struct RateConfig {
     pub connect_concurrent: usize,
     #[serde(default = "default_msg_per_sec")]
     pub msg_per_sec: u32,
+    /// backpressure 发送端 TPS 下限断言。**不设 = smoke 不断言 TPS（SKIP）**；
+    /// gate profile 设为 50（或对齐 REVIEW_CHECKLIST §B）。避免 gate 阈值套在 smoke 规模上假失败。
+    #[serde(default)]
+    pub min_sender_tps: Option<f64>,
 }
 
 impl Default for RateConfig {
@@ -80,6 +84,7 @@ impl Default for RateConfig {
             connect_per_sec: default_connect_per_sec(),
             connect_concurrent: default_connect_concurrent(),
             msg_per_sec: default_msg_per_sec(),
+            min_sender_tps: None,
         }
     }
 }

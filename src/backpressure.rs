@@ -289,16 +289,20 @@ pub async fn run_backpressure(
     };
     report.assert_lte("error_rate", error_rate, 0.10);
 
-    // TPS > 50（即使有慢消费者，发送端吞吐不应太低）
+    // 发送端 TPS：即使有慢消费者，发送吞吐不应崩塌。
+    // 阈值 profile 化：smoke（未配 min_sender_tps）SKIP，避免 gate 级阈值套在 smoke 规模上假失败；
+    // gate 在 conf 里设 min_sender_tps=50（或对齐 REVIEW_CHECKLIST §B）。
     let tps = if duration_sec > 0 {
         messages_sent as f64 / duration_sec as f64
     } else {
         0.0
     };
-    if messages_sent > 0 {
-        report.assert_gte("sender_tps", tps, 50.0);
-    } else {
+    if messages_sent == 0 {
         report.skip("sender_tps", "no messages sent");
+    } else if let Some(min_tps) = rate.min_sender_tps {
+        report.assert_gte("sender_tps", tps, min_tps);
+    } else {
+        report.skip("sender_tps", "smoke profile: min_sender_tps 未配置（gate 才断言 TPS）");
     }
 
     Ok(BackpressureResult {
