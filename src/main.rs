@@ -57,7 +57,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config = TestConfig::load(&config_path)?;
     let data_dir = find_data_dir();
-    let users_file = data_dir.join("users.txt");
+    // 用户命名空间卫生：设 LOAD_TEST_USER_PREFIX=<x> → 全新 users_<x>.txt + <x>_NNNNNN 用户名，
+    // 一条命令即可复现干净跑（免手工 SQL / 重建 users.txt / 撞旧 RS256 失效 token）；不设=默认 loadtest。
+    let user_prefix = std::env::var("LOAD_TEST_USER_PREFIX").unwrap_or_else(|_| "loadtest".to_string());
+    let users_file = if user_prefix == "loadtest" {
+        data_dir.join("users.txt")
+    } else {
+        data_dir.join(format!("users_{}.txt", user_prefix))
+    };
     let env = LoadTestEnv::from_env();
 
     info!("data_dir: {}", data_dir.display());

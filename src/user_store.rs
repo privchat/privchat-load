@@ -129,8 +129,9 @@ pub async fn ensure_users(
     let endpoints = server_endpoints(server_host, server_port);
     let base = records.len() as u32;
 
+    let prefix = std::env::var("LOAD_TEST_USER_PREFIX").unwrap_or_else(|_| "loadtest".to_string());
     for i in 0..to_register {
-        let username = format!("loadtest_{:06}", base + i as u32);
+        let username = format!("{}_{:06}", prefix, base + i as u32);
         let device_id = uuid::Uuid::new_v4().to_string();
         let user_data_dir = users_root.join(&username);
         std::fs::create_dir_all(&user_data_dir)?;
