@@ -261,7 +261,18 @@ pub async fn run_backpressure(
     // RSS 增长 < 200MB（§B **server** RSS 门禁）。
     // 只有设 LOAD_TEST_SERVER_PID 才测服务端 RSS 并断言；否则测的是 load 工具自身 RSS，
     // **不能用客户端 RSS 假证服务端有界** → SKIP。
-    if rss_server_pid().is_none() {
+    // gate（require_server_rss=true）下：server RSS 无效必须 **FAIL**，不能 SKIP 后假 exit 0。
+    let server_rss_ok = rss_server_pid().is_some() && rss_start > 0.0;
+    if rate.require_server_rss {
+        report.assert_gte(
+            "server_rss_available",
+            if server_rss_ok { 1.0 } else { 0.0 },
+            1.0,
+        );
+        if server_rss_ok {
+            report.assert_lte("rss_growth_mb", rss_growth_mb, 200.0);
+        }
+    } else if rss_server_pid().is_none() {
         report.skip(
             "rss_growth_mb",
             "LOAD_TEST_SERVER_PID 未设：这是 load-process RSS，非 §B server 门禁",

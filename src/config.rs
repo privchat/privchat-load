@@ -76,6 +76,10 @@ pub struct RateConfig {
     /// gate profile 设为 50（或对齐 REVIEW_CHECKLIST §B）。避免 gate 阈值套在 smoke 规模上假失败。
     #[serde(default)]
     pub min_sender_tps: Option<f64>,
+    /// gate 硬要求：true 时 server RSS 必须有效（缺 `LOAD_TEST_SERVER_PID` / 采样失败 → **FAIL 而非 SKIP**），
+    /// 防止用错 PID 跑 gate 仍假 exit 0。smoke 不设 = false。
+    #[serde(default)]
+    pub require_server_rss: bool,
 }
 
 impl Default for RateConfig {
@@ -85,6 +89,7 @@ impl Default for RateConfig {
             connect_concurrent: default_connect_concurrent(),
             msg_per_sec: default_msg_per_sec(),
             min_sender_tps: None,
+            require_server_rss: false,
         }
     }
 }
