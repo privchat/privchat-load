@@ -24,42 +24,26 @@ use std::time::{Duration, Instant};
 use tokio::time::{interval, sleep};
 use tracing::{info, warn};
 
-/// RSS 内存快照（bytes）
+/// RSS 采样目标：设 `LOAD_TEST_SERVER_PID=<pid>` → 测**服务端**进程（REVIEW_CHECKLIST §B 的
+/// server RSS 门禁需要此项）；不设 → 测 load 工具自身（仅参考，**非 §B 门禁**）。
+fn rss_server_pid() -> Option<String> {
+    std::env::var("LOAD_TEST_SERVER_PID")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
+/// RSS 内存快照（bytes）。目标 = server PID（若设）否则自身。`ps -o rss=` 在 macOS/Linux 通用。
 fn rss_bytes() -> u64 {
-    // macOS: use mach API via libc; fallback to 0
-    #[cfg(target_os = "macos")]
+    let pid = rss_server_pid().unwrap_or_else(|| std::process::id().to_string());
+    if let Ok(out) = std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &pid])
+        .output()
     {
-        use std::process;
-        // read from ps command as simple cross-platform fallback
-        let output = process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &process::id().to_string()])
-            .output();
-        if let Ok(out) = output {
-            let s = String::from_utf8_lossy(&out.stdout);
-            // ps reports RSS in KB
-            if let Ok(kb) = s.trim().parse::<u64>() {
-                return kb * 1024;
-            }
+        if let Ok(kb) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+            return kb * 1024;
         }
-        0
     }
-    #[cfg(target_os = "linux")]
-    {
-        // /proc/self/statm: pages; page size typically 4096
-        if let Ok(s) = std::fs::read_to_string("/proc/self/statm") {
-            let parts: Vec<&str> = s.split_whitespace().collect();
-            if parts.len() >= 2 {
-                if let Ok(pages) = parts[1].parse::<u64>() {
-                    return pages * 4096;
-                }
-            }
-        }
-        0
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        0
-    }
+    0
 }
 
 fn rss_mb() -> f64 {
@@ -274,11 +258,18 @@ pub async fn run_backpressure(
         report.skip("sender_p99_latency_ms", "no messages sent");
     }
 
-    // RSS 增长 < 200MB（内存不爆）
-    if rss_start > 0.0 {
+    // RSS 增长 < 200MB（§B **server** RSS 门禁）。
+    // 只有设 LOAD_TEST_SERVER_PID 才测服务端 RSS 并断言；否则测的是 load 工具自身 RSS，
+    // **不能用客户端 RSS 假证服务端有界** → SKIP。
+    if rss_server_pid().is_none() {
+        report.skip(
+            "rss_growth_mb",
+            "LOAD_TEST_SERVER_PID 未设：这是 load-process RSS，非 §B server 门禁",
+        );
+    } else if rss_start > 0.0 {
         report.assert_lte("rss_growth_mb", rss_growth_mb, 200.0);
     } else {
-        report.skip("rss_growth_mb", "RSS not available on this platform");
+        report.skip("rss_growth_mb", "server RSS 采样失败（PID 无效？）");
     }
 
     // 错误率 < 10%
