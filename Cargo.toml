@@ -12,7 +12,7 @@ name = "privchat-load"
 path = "src/main.rs"
 
 [dependencies]
-privchat-sdk = { path = "../privchat-rust/crates/privchat-sdk" }
+privchat-sdk = { path = "../privchat-sdk/crates/privchat-sdk" }
 privchat-protocol = { path = "../privchat-protocol" }
 
 tokio = { version = "1.0", features = ["full"] }
