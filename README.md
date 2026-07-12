@@ -1,6 +1,6 @@
 # privchat-load
 
-PrivChat 压测 & 语义验证工具，独立项目，与 privchat-server、privchat-rust 同级。
+PrivChat 压测 & 语义验证工具，独立项目，与 privchat-server、privchat-sdk 同级。
 
 ## 快速开始
 
