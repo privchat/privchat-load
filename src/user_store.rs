@@ -73,29 +73,36 @@ fn append_user(
 
 /// 构建 server endpoints
 pub fn server_endpoints(host: &str, port: u16) -> Vec<ServerEndpoint> {
-    vec![
-        ServerEndpoint {
-            protocol: TransportProtocol::Quic,
-            host: host.to_string(),
-            port,
-            path: None,
-            use_tls: false,
-        },
-        ServerEndpoint {
-            protocol: TransportProtocol::Tcp,
-            host: host.to_string(),
-            port,
-            path: None,
-            use_tls: false,
-        },
-        ServerEndpoint {
-            protocol: TransportProtocol::WebSocket,
-            host: host.to_string(),
-            port: if port == 9001 { 9080 } else { port + 1 },
-            path: Some("/".to_string()),
-            use_tls: false,
-        },
-    ]
+    let tcp = ServerEndpoint {
+        protocol: TransportProtocol::Tcp,
+        host: host.to_string(),
+        port,
+        path: None,
+        use_tls: false,
+    };
+    let quic = ServerEndpoint {
+        protocol: TransportProtocol::Quic,
+        host: host.to_string(),
+        port,
+        path: None,
+        use_tls: false,
+    };
+    let ws = ServerEndpoint {
+        protocol: TransportProtocol::WebSocket,
+        host: host.to_string(),
+        port: if port == 9001 { 9080 } else { port + 1 },
+        path: Some("/".to_string()),
+        use_tls: false,
+    };
+    // [G8] LOAD_TEST_PROTOCOL 强制**单协议、不 fallback**，用于隔离 QUIC vs TCP vs fallback 的建连耗时
+    // （之前固定 QUIC→TCP→WebSocket，每次先 QUIC 失败再回退，污染了协议对照）。
+    // 不设 = 保留历史 fallback 顺序（兼容旧场景）。
+    match std::env::var("LOAD_TEST_PROTOCOL").ok().as_deref() {
+        Some("tcp") => vec![tcp],
+        Some("quic") => vec![quic],
+        Some("websocket") | Some("ws") => vec![ws],
+        _ => vec![quic, tcp, ws],
+    }
 }
 
 /// 确保至少有 total 个用户：不足则注册并写入 users.txt
