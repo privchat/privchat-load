@@ -22,6 +22,12 @@ pub struct ServerConfig {
     pub port: u16,
     #[serde(default = "default_protocol")]
     pub protocol: String,
+    /// Allow local/load-test QUIC clients to accept the server's self-signed cert.
+    ///
+    /// None means "auto": enabled only for local QUIC targets. Set false for a
+    /// production-like strict certificate verification run.
+    #[serde(default)]
+    pub allow_self_signed_quic: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -45,7 +51,10 @@ impl ScenarioConfig {
             "mixed" => ScenarioType::Mixed,
             "semantic_verify" => ScenarioType::SemanticVerify,
             "backpressure" => ScenarioType::Backpressure,
-            "auth_peak" => ScenarioType::AuthPeak,
+            // auth_peak = 密码登录峰值（含 bcrypt）；reconnect_token_peak = 真实重连风暴
+            // （connect + token authenticate，无 bcrypt）。G8 拆两场景，见各自 run_*。
+            "auth_peak" | "auth_peak_login" => ScenarioType::AuthPeak,
+            "reconnect_token_peak" => ScenarioType::ReconnectTokenPeak,
             _ => ScenarioType::GroupBroadcast,
         }
     }
@@ -60,7 +69,10 @@ pub enum ScenarioType {
     Mixed,
     SemanticVerify,
     Backpressure,
+    /// 密码登录峰值：connect + password login(bcrypt) + authenticate。
     AuthPeak,
+    /// 重连风暴：warmup 拿 token → 峰值 connect + token authenticate（无 bcrypt，真实 reconnect 路径）。
+    ReconnectTokenPeak,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -200,4 +212,36 @@ impl TestConfig {
         }
         Ok(c)
     }
+}
+
+impl ServerConfig {
+    pub fn effective_protocol(&self) -> String {
+        std::env::var("LOAD_TEST_PROTOCOL")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| self.protocol.trim().to_ascii_lowercase())
+    }
+
+    pub fn allow_self_signed_quic(&self) -> bool {
+        if let Some(value) = env_bool("LOAD_TEST_QUIC_ACCEPT_SELF_SIGNED") {
+            return value;
+        }
+
+        self.allow_self_signed_quic
+            .unwrap_or_else(|| self.effective_protocol() == "quic" && is_local_host(&self.host))
+    }
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    let value = std::env::var(key).ok()?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn is_local_host(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
 }

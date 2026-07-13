@@ -17,7 +17,7 @@ use assertions::AssertionReport;
 use config::{EnvThresholds, LoadTestEnv, ScenarioType, TestConfig};
 use scenario::ScenarioStats;
 use std::path::PathBuf;
-use tracing::info;
+use tracing::{info, warn};
 
 /// 配置路径：优先当前工作目录
 fn find_config_path() -> PathBuf {
@@ -59,7 +59,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let data_dir = find_data_dir();
     // 用户命名空间卫生：设 LOAD_TEST_USER_PREFIX=<x> → 全新 users_<x>.txt + <x>_NNNNNN 用户名，
     // 一条命令即可复现干净跑（免手工 SQL / 重建 users.txt / 撞旧 RS256 失效 token）；不设=默认 loadtest。
-    let user_prefix = std::env::var("LOAD_TEST_USER_PREFIX").unwrap_or_else(|_| "loadtest".to_string());
+    let user_prefix =
+        std::env::var("LOAD_TEST_USER_PREFIX").unwrap_or_else(|_| "loadtest".to_string());
     let users_file = if user_prefix == "loadtest" {
         data_dir.join("users.txt")
     } else {
@@ -79,14 +80,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("warmup: {} sec", config.run.warmup_sec);
     info!("env: {:?}", env);
 
+    if config.server.allow_self_signed_quic() {
+        privchat_sdk::set_quic_accept_self_signed_for_testing(true);
+        warn!("QUIC self-signed certificate verification is disabled for this load-test process");
+    }
+
     let password =
         std::env::var("LOAD_TEST_PASSWORD").unwrap_or_else(|_| "loadtest123".to_string());
+    let server_protocol = config.server.effective_protocol();
     let records = user_store::ensure_users(
         &data_dir,
         &users_file,
         config.users.total,
         &config.server.host,
         config.server.port,
+        &server_protocol,
         &password,
     )
     .await?;
@@ -110,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             &data_dir,
             &config.server.host,
             config.server.port,
+            &server_protocol,
             metrics_url.as_deref(),
         )
         .await?;
@@ -137,11 +146,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
+    // reconnect_token_peak：G8 真实重连风暴（connect + token authenticate，无 bcrypt）。
+    // 与 auth_peak(密码登录峰值) 一样自管连接周期，跳过预建 SDK。
+    if scenario_type == ScenarioType::ReconnectTokenPeak {
+        let metrics_url = std::env::var("LOAD_TEST_METRICS_URL").ok();
+        let result = auth_peak::run_reconnect_token_peak(
+            &records,
+            &data_dir,
+            &config.server.host,
+            config.server.port,
+            &server_protocol,
+            metrics_url.as_deref(),
+        )
+        .await?;
+
+        println!("\n===== reconnect token peak result =====");
+        println!(
+            "  warmup token rate:     {:.1}%",
+            result.baseline_success_rate * 100.0
+        );
+        println!(
+            "  peak success rate:     {:.1}%",
+            result.peak_success_rate * 100.0
+        );
+        println!("  peak p99 (connect+auth): {:.2} ms", result.peak_p99_ms);
+        println!("=======================================\n");
+
+        let report = result.report;
+        report.print();
+
+        if !report.all_passed() {
+            eprintln!("{} assertions failed, exit code 1", report.fail_count());
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     let (sdks, connect_elapsed_secs) = scenario::create_all_sdks(
         &records,
         &data_dir,
         &config.server.host,
         config.server.port,
+        &server_protocol,
         &config.rate,
     )
     .await?;

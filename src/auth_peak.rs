@@ -101,8 +101,9 @@ async fn connect_and_auth_one(
     data_dir: &Path,
     server_host: &str,
     server_port: u16,
+    server_protocol: &str,
 ) -> Result<(Arc<PrivchatSdk>, f64), Box<dyn std::error::Error + Send + Sync>> {
-    let endpoints = crate::user_store::server_endpoints(server_host, server_port);
+    let endpoints = crate::user_store::server_endpoints(server_host, server_port, server_protocol);
     let user_data_dir = data_dir.join("users").join(&record.username);
     std::fs::create_dir_all(&user_data_dir)?;
 
@@ -158,6 +159,7 @@ pub async fn run_auth_peak(
     data_dir: &Path,
     server_host: &str,
     server_port: u16,
+    server_protocol: &str,
     metrics_url: Option<&str>,
 ) -> Result<AuthPeakResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut report = AssertionReport::new();
@@ -172,7 +174,9 @@ pub async fn run_auth_peak(
     let mut baseline_sdks = Vec::with_capacity(total);
 
     for (i, record) in records.iter().enumerate() {
-        match connect_and_auth_one(record, data_dir, server_host, server_port).await {
+        match connect_and_auth_one(record, data_dir, server_host, server_port, server_protocol)
+            .await
+        {
             Ok((sdk, latency_ms)) => {
                 baseline_ok += 1;
                 let us = (latency_ms * 1000.0) as u64;
@@ -227,6 +231,7 @@ pub async fn run_auth_peak(
 
     let data_dir_buf = data_dir.to_path_buf();
     let server_host_str = server_host.to_string();
+    let server_protocol_str = server_protocol.to_string();
 
     // Fix 2: 峰值**期间**采样 /metrics 记录 max（结束态采一次不可信）。
     let peak_max = Arc::new(std::sync::Mutex::new((0.0f64, 0.0f64, 0.0f64))); // (db_active, redis_active, conns)
@@ -257,8 +262,9 @@ pub async fn run_auth_peak(
         let record = record.clone();
         let data_dir = data_dir_buf.clone();
         let host = server_host_str.clone();
+        let protocol = server_protocol_str.clone();
         handles.push(tokio::spawn(async move {
-            connect_and_auth_one(&record, &data_dir, &host, server_port).await
+            connect_and_auth_one(&record, &data_dir, &host, server_port, &protocol).await
         }));
     }
 
@@ -292,7 +298,10 @@ pub async fn run_auth_peak(
                 {
                     // SDK/harness 状态 race，非 server 拒绝。归因未完成前单列，不算作 server 侧失败。
                     peak_state_errors += 1;
-                    warn!("[auth_peak] peak connect {} SDK-state error (归因待查): {}", i, e);
+                    warn!(
+                        "[auth_peak] peak connect {} SDK-state error (归因待查): {}",
+                        i, e
+                    );
                 } else {
                     peak_other_errors += 1;
                     warn!("[auth_peak] peak connect {} failed: {}", i, e);
@@ -408,6 +417,270 @@ pub async fn run_auth_peak(
         baseline_p99_ms,
         peak_p99_ms,
         baseline_success_rate,
+        peak_success_rate,
+    })
+}
+
+// ============================================================================
+// 场景：重连认证峰值（G8 真实路径）——与上面的密码登录峰值(auth_peak)拆开。
+//
+// 真实的"服务端重启 → 全体重连"风暴走的是 connect + token authenticate，**不含**
+// 密码登录/bcrypt。server profile 显示密码登录峰值里唯一用户态热点是 bcrypt，所以
+// 用它无法证明 reconnect path 绿不绿。本场景把 bcrypt 挡在顺序 warmup 里，峰值只测
+// 真实重连建连+认证延迟。
+// ============================================================================
+
+/// warmup 期拿到的新鲜凭证（不用 users.txt 里可能过期的 token）。
+#[derive(Clone)]
+struct TokenCreds {
+    username: String,
+    user_id: u64,
+    token: String,
+    device_id: String,
+}
+
+/// warmup：顺序 password login 拿一个新鲜 token 后关闭（bcrypt 在此，不计入峰值）。
+async fn warmup_login_one(
+    record: &UserRecord,
+    data_dir: &Path,
+    server_host: &str,
+    server_port: u16,
+    server_protocol: &str,
+) -> Result<TokenCreds, Box<dyn std::error::Error + Send + Sync>> {
+    let endpoints = crate::user_store::server_endpoints(server_host, server_port, server_protocol);
+    // 独立干净目录：避免复用 users/<user> 里旧 session 快照，否则 connect() 会用**过期 token**
+    // 触发 auto-restore 直接失败（[10002] Token 已过期），login() 根本没机会跑。
+    let user_data_dir = data_dir.join("reconnect_warmup").join(&record.username);
+    std::fs::create_dir_all(&user_data_dir)?;
+    let config = PrivchatConfig {
+        endpoints,
+        connection_timeout_secs: 30,
+        data_dir: user_data_dir.to_string_lossy().to_string(),
+    };
+    let sdk = PrivchatSdk::new(config);
+    sdk.connect().await?;
+    let password =
+        std::env::var("LOAD_TEST_PASSWORD").unwrap_or_else(|_| "loadtest123".to_string());
+    let login = sdk
+        .login(record.username.clone(), password, record.device_id.clone())
+        .await?;
+    let creds = TokenCreds {
+        username: record.username.clone(),
+        user_id: login.user_id,
+        token: login.token,
+        device_id: login.device_id,
+    };
+    sdk.shutdown().await;
+    Ok(creds)
+}
+
+/// 峰值：fresh SDK + connect + token authenticate（**无 password login / 无 bcrypt**）。
+/// 用独立空 data_dir，避免本地 session 快照触发 auto-restore 而模糊 connect/auth 分段。
+/// 返回 connect+state+auth 总延迟(ms)。
+async fn connect_and_token_auth_one(
+    creds: &TokenCreds,
+    data_dir: &Path,
+    server_host: &str,
+    server_port: u16,
+    server_protocol: &str,
+) -> Result<(Arc<PrivchatSdk>, f64), Box<dyn std::error::Error + Send + Sync>> {
+    let endpoints = crate::user_store::server_endpoints(server_host, server_port, server_protocol);
+    let user_data_dir = data_dir.join("reconnect_peak").join(&creds.username);
+    std::fs::create_dir_all(&user_data_dir)?;
+    let config = PrivchatConfig {
+        endpoints,
+        connection_timeout_secs: 30,
+        data_dir: user_data_dir.to_string_lossy().to_string(),
+    };
+    let t0 = Instant::now();
+    let sdk = PrivchatSdk::new(config);
+    sdk.connect().await?;
+    let connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let ts = Instant::now();
+    match sdk.connection_state().await {
+        Ok(ConnectionState::Connected)
+        | Ok(ConnectionState::LoggedIn)
+        | Ok(ConnectionState::Authenticated) => {}
+        Ok(other) => return Err(format!("connect_returned_state_{other:?}").into()),
+        Err(e) => return Err(format!("connect_returned_state_err: {e}").into()),
+    }
+    let state_ms = ts.elapsed().as_secs_f64() * 1000.0;
+    let ta = Instant::now();
+    sdk.authenticate(creds.user_id, creds.token.clone(), creds.device_id.clone())
+        .await?;
+    let auth_ms = ta.elapsed().as_secs_f64() * 1000.0;
+    let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    info!(
+        "[reconnect_token] stage user={} connect={:.0} state={:.0} auth={:.0} total={:.0} ms",
+        creds.username, connect_ms, state_ms, auth_ms, elapsed_ms
+    );
+    Ok((Arc::new(sdk), elapsed_ms))
+}
+
+/// 场景：重连认证峰值。Phase1 warmup(顺序 login 拿新鲜 token) → Phase2 settle →
+/// Phase3 peak(全部并发 connect + token authenticate)。
+pub async fn run_reconnect_token_peak(
+    records: &[UserRecord],
+    data_dir: &Path,
+    server_host: &str,
+    server_port: u16,
+    server_protocol: &str,
+    metrics_url: Option<&str>,
+) -> Result<AuthPeakResult, Box<dyn std::error::Error + Send + Sync>> {
+    let mut report = AssertionReport::new();
+    let total = records.len();
+    info!("[reconnect_token] total users: {}", total);
+
+    // 清理上一轮的临时会话目录，保证每次跑都是干净重连（无 stale session 快照）。
+    let _ = std::fs::remove_dir_all(data_dir.join("reconnect_warmup"));
+    let _ = std::fs::remove_dir_all(data_dir.join("reconnect_peak"));
+
+    // === Phase 1: warmup —— 顺序 password login 拿新鲜 token（bcrypt 在此，不计峰值）===
+    info!("[reconnect_token] Phase 1: warmup logins (sequential) to get fresh tokens");
+    let mut creds_list: Vec<TokenCreds> = Vec::with_capacity(total);
+    for (i, record) in records.iter().enumerate() {
+        match warmup_login_one(record, data_dir, server_host, server_port, server_protocol).await {
+            Ok(c) => creds_list.push(c),
+            Err(e) => warn!("[reconnect_token] warmup login {} failed: {}", i, e),
+        }
+    }
+    let warmup_ok = creds_list.len();
+    let warmup_rate = warmup_ok as f64 / total.max(1) as f64;
+    info!(
+        "[reconnect_token] warmup: {}/{} tokens acquired ({:.1}%)",
+        warmup_ok,
+        total,
+        warmup_rate * 100.0
+    );
+    if creds_list.is_empty() {
+        report.assert_gte("warmup_token_rate", 0.0, 0.95); // FAIL：一个 token 都没拿到
+        return Ok(AuthPeakResult {
+            report,
+            baseline_p99_ms: 0.0,
+            peak_p99_ms: 0.0,
+            baseline_success_rate: 0.0,
+            peak_success_rate: 0.0,
+        });
+    }
+
+    // === Phase 2: settle ===
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    // === Phase 3: peak —— 全部并发 connect + token authenticate ===
+    info!("[reconnect_token] Phase 3: peak concurrent connect + token authenticate");
+    let peak_max = Arc::new(std::sync::Mutex::new((0.0f64, 0.0f64, 0.0f64)));
+    let metrics_samples = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = metrics_url.map(|u| {
+        let url = u.to_string();
+        let peak_max = peak_max.clone();
+        let samples = metrics_samples.clone();
+        let stop = sampler_stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(m) = fetch_server_metrics(&url).await {
+                    samples.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut mx = peak_max.lock().unwrap();
+                    mx.0 = mx.0.max(m.db_pool_active.unwrap_or(0.0));
+                    mx.1 = mx.1.max(m.redis_pool_active.unwrap_or(0.0));
+                    mx.2 = mx.2.max(m.active_connections.unwrap_or(0.0));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        })
+    });
+
+    let data_dir_buf = data_dir.to_path_buf();
+    let host = server_host.to_string();
+    let proto = server_protocol.to_string();
+    let t0 = Instant::now();
+    let mut handles = Vec::with_capacity(creds_list.len());
+    for creds in creds_list.iter() {
+        let creds = creds.clone();
+        let dd = data_dir_buf.clone();
+        let h = host.clone();
+        let p = proto.clone();
+        handles.push(tokio::spawn(async move {
+            connect_and_token_auth_one(&creds, &dd, &h, server_port, &p).await
+        }));
+    }
+
+    let mut peak_hist: Histogram<u64> = Histogram::new_with_max(60_000_000, 3).unwrap();
+    let mut peak_ok = 0u64;
+    let mut peak_conn_refused = 0u64;
+    let mut peak_state_errors = 0u64;
+    let mut peak_other_errors = 0u64;
+    for (i, handle) in handles.into_iter().enumerate() {
+        match handle.await {
+            Ok(Ok((_sdk, latency_ms))) => {
+                peak_ok += 1;
+                let _ = peak_hist.record((latency_ms * 1000.0) as u64);
+            }
+            Ok(Err(e)) => {
+                let s = e.to_string().to_lowercase();
+                if s.contains("refused") || s.contains("timeout") || s.contains("handshake") {
+                    peak_conn_refused += 1;
+                } else if s.contains("connect_returned_state")
+                    || s.contains("connect first")
+                    || s.contains("invalid state")
+                {
+                    peak_state_errors += 1;
+                } else {
+                    peak_other_errors += 1;
+                }
+                warn!("[reconnect_token] peak {} failed: {}", i, e);
+            }
+            Err(e) => {
+                peak_other_errors += 1;
+                warn!("[reconnect_token] peak task {} panicked: {}", i, e);
+            }
+        }
+    }
+    let peak_elapsed = t0.elapsed();
+    sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = sampler {
+        let _ = h.await;
+    }
+    let (db_active_max, redis_active_max, conns_max) = *peak_max.lock().unwrap();
+
+    let n = creds_list.len();
+    let peak_success_rate = peak_ok as f64 / n as f64;
+    let peak_p99_ms = if !peak_hist.is_empty() {
+        peak_hist.value_at_quantile(0.99) as f64 / 1000.0
+    } else {
+        0.0
+    };
+    let conn_refused_rate = peak_conn_refused as f64 / n as f64;
+    info!(
+        "[reconnect_token] peak: {}/{} ok, refused/timeout={}, sdk_state_err={}, other_err={}, p99={:.2}ms, elapsed={:.2}s, db_max={:.0} conns_max={:.0}",
+        peak_ok, n, peak_conn_refused, peak_state_errors, peak_other_errors, peak_p99_ms,
+        peak_elapsed.as_secs_f64(), db_active_max, conns_max
+    );
+
+    // === Assertions（G8 真实重连路径）===
+    report.assert_gte("warmup_token_rate", warmup_rate, 0.95);
+    report.assert_gte("reconnect_peak_success_rate", peak_success_rate, 0.90);
+    if peak_ok > 0 {
+        report.assert_lte("reconnect_peak_p99_ms", peak_p99_ms, 5000.0);
+    } else {
+        report.skip("reconnect_peak_p99_ms", "no successful peak reconnects");
+    }
+    report.assert_lte("reconnect_conn_refused_rate", conn_refused_rate, 0.05);
+    let n_samples = metrics_samples.load(std::sync::atomic::Ordering::Relaxed);
+    if metrics_url.is_some() {
+        report.assert_gte(
+            "metrics_sampled",
+            if n_samples > 0 { 1.0 } else { 0.0 },
+            1.0,
+        );
+    }
+    let _ = (redis_active_max, db_active_max, conns_max);
+
+    Ok(AuthPeakResult {
+        report,
+        baseline_p99_ms: 0.0, // 本场景无延迟 baseline 阶段
+        peak_p99_ms,
+        baseline_success_rate: warmup_rate,
         peak_success_rate,
     })
 }

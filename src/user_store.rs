@@ -71,8 +71,12 @@ fn append_user(
     Ok(())
 }
 
-/// 构建 server endpoints
-pub fn server_endpoints(host: &str, port: u16) -> Vec<ServerEndpoint> {
+/// 构建 server endpoints.
+///
+/// `LOAD_TEST_PROTOCOL` can override the config protocol for quick matrix runs.
+/// Otherwise this honors `[server].protocol` and returns a single endpoint, so
+/// protocol measurements are not polluted by fallback.
+pub fn server_endpoints(host: &str, port: u16, protocol: &str) -> Vec<ServerEndpoint> {
     let tcp = ServerEndpoint {
         protocol: TransportProtocol::Tcp,
         host: host.to_string(),
@@ -94,14 +98,25 @@ pub fn server_endpoints(host: &str, port: u16) -> Vec<ServerEndpoint> {
         path: Some("/".to_string()),
         use_tls: false,
     };
-    // [G8] LOAD_TEST_PROTOCOL 强制**单协议、不 fallback**，用于隔离 QUIC vs TCP vs fallback 的建连耗时
-    // （之前固定 QUIC→TCP→WebSocket，每次先 QUIC 失败再回退，污染了协议对照）。
-    // 不设 = 保留历史 fallback 顺序（兼容旧场景）。
-    match std::env::var("LOAD_TEST_PROTOCOL").ok().as_deref() {
-        Some("tcp") => vec![tcp],
-        Some("quic") => vec![quic],
-        Some("websocket") | Some("ws") => vec![ws],
-        _ => vec![quic, tcp, ws],
+    let protocol = std::env::var("LOAD_TEST_PROTOCOL")
+        .ok()
+        .unwrap_or_else(|| protocol.to_string())
+        .trim()
+        .to_ascii_lowercase();
+
+    match protocol.as_str() {
+        "tcp" => vec![tcp],
+        "quic" => vec![quic],
+        "websocket" | "ws" => vec![ws],
+        // 压测工具里协议 typo 必须 fail-fast，不能静默 fallback 到多协议——否则
+        // 会重新污染 TCP/QUIC 对照（正是这轮 G8 "37s" 的根因）。
+        other => {
+            eprintln!(
+                "[load] FATAL: unknown protocol {other:?} — expected one of tcp|quic|websocket|ws \
+                 (set [server].protocol or LOAD_TEST_PROTOCOL). Refusing to silently fall back."
+            );
+            std::process::exit(1);
+        }
     }
 }
 
@@ -112,6 +127,7 @@ pub async fn ensure_users(
     total: u32,
     server_host: &str,
     server_port: u16,
+    server_protocol: &str,
     password: &str,
 ) -> Result<Vec<UserRecord>, Box<dyn std::error::Error + Send + Sync>> {
     let users_root = data_dir.join("users");
@@ -133,7 +149,7 @@ pub async fn ensure_users(
         need
     );
 
-    let endpoints = server_endpoints(server_host, server_port);
+    let endpoints = server_endpoints(server_host, server_port, server_protocol);
     let base = records.len() as u32;
 
     let prefix = std::env::var("LOAD_TEST_USER_PREFIX").unwrap_or_else(|_| "loadtest".to_string());

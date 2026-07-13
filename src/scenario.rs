@@ -48,8 +48,9 @@ pub async fn create_sdk_for_user(
     _data_dir: &Path,
     server_host: &str,
     server_port: u16,
+    server_protocol: &str,
 ) -> Result<Arc<PrivchatSdk>, Box<dyn std::error::Error + Send + Sync>> {
-    let endpoints = crate::user_store::server_endpoints(server_host, server_port);
+    let endpoints = crate::user_store::server_endpoints(server_host, server_port, server_protocol);
     let user_data_dir = _data_dir.join("users").join(&record.username);
     std::fs::create_dir_all(&user_data_dir)?;
 
@@ -82,11 +83,13 @@ pub async fn create_all_sdks(
     data_dir: &Path,
     server_host: &str,
     server_port: u16,
+    server_protocol: &str,
     rate: &RateConfig,
 ) -> Result<(Vec<Arc<PrivchatSdk>>, f64), Box<dyn std::error::Error + Send + Sync>> {
     let total = records.len();
     let data_dir = data_dir.to_path_buf();
     let server_host = server_host.to_string();
+    let server_protocol = server_protocol.to_string();
     let concurrent = rate.connect_concurrent.max(1).min(total);
 
     if rate.connect_per_sec > 0 {
@@ -101,7 +104,15 @@ pub async fn create_all_sdks(
         let t0 = Instant::now();
         for (i, record) in records.iter().enumerate() {
             tick.tick().await;
-            match create_sdk_for_user(record, &data_dir, &server_host, server_port).await {
+            match create_sdk_for_user(
+                record,
+                &data_dir,
+                &server_host,
+                server_port,
+                &server_protocol,
+            )
+            .await
+            {
                 Ok(sdk) => sdks.push(sdk),
                 Err(e) => warn!("创建 SDK 失败 [{}] {}: {}", i, record.username, e),
             }
@@ -119,10 +130,18 @@ pub async fn create_all_sdks(
         let record = record.clone();
         let data_dir = data_dir.clone();
         let server_host = server_host.clone();
+        let server_protocol = server_protocol.clone();
         let sem = sem.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = sem.acquire().await.expect("semaphore closed");
-            create_sdk_for_user(&record, &data_dir, &server_host, server_port).await
+            create_sdk_for_user(
+                &record,
+                &data_dir,
+                &server_host,
+                server_port,
+                &server_protocol,
+            )
+            .await
         }));
     }
 
@@ -448,7 +467,10 @@ pub async fn run_scenario(
             .await
         }
         ScenarioType::FriendFlow => run_friend_flow(main_sdk, sdks, records).await,
-        ScenarioType::SemanticVerify | ScenarioType::Backpressure | ScenarioType::AuthPeak => {
+        ScenarioType::SemanticVerify
+        | ScenarioType::Backpressure
+        | ScenarioType::AuthPeak
+        | ScenarioType::ReconnectTokenPeak => {
             // Handled separately in main.rs
             Ok(ScenarioStats::default())
         }

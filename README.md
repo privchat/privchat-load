@@ -47,6 +47,7 @@ privchat-load/
 | `[server]` | `host` | `"127.0.0.1"` | 服务器地址 |
 | | `port` | `9001` | 服务器端口 |
 | | `protocol` | `"quic"` | 传输协议：`quic` / `tcp` / `websocket` |
+| | `allow_self_signed_quic` | `auto` | QUIC 是否接受自签证书；默认仅本地 QUIC 压测开启 |
 | `[users]` | `total` | `100` | 测试用户数（不足时自动注册） |
 | `[scenario]` | `type` | `"group_broadcast"` | 场景类型（见下方） |
 | `[rate]` | `connect_per_sec` | `0` | 连接速率限制（0 = 全速并发） |
@@ -62,6 +63,8 @@ privchat-load/
 | `LOAD_TEST_PASSWORD` | `"loadtest123"` | 测试账号密码 |
 | `LOAD_TEST_ENV` | `"local"` | 环境模式：`local`（宽松阈值）/ `ci`（严格阈值） |
 | `LOAD_TEST_METRICS_URL` | - | Prometheus metrics URL（auth_peak 用） |
+| `LOAD_TEST_PROTOCOL` | 配置文件值 | 临时强制单协议：`quic` / `tcp` / `websocket` |
+| `LOAD_TEST_QUIC_ACCEPT_SELF_SIGNED` | `auto` | 强制控制 QUIC 自签证书：`1` 开启，`0` 关闭 |
 
 ## 场景
 
@@ -135,6 +138,8 @@ cargo run --release -- --config test_c.conf   # 50 用户
 host = "127.0.0.1"
 port = 9001
 protocol = "quic"
+# 本地 QUIC 默认自动允许自签证书；远端压测建议显式设为 false。
+# allow_self_signed_quic = true
 
 [users]
 total = 20
@@ -155,6 +160,8 @@ duration_sec = 10
 host = "127.0.0.1"
 port = 9001
 protocol = "quic"
+# 本地 QUIC 默认自动允许自签证书；远端压测建议显式设为 false。
+# allow_self_signed_quic = true
 
 [users]
 total = 1000
