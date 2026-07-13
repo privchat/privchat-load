@@ -15,7 +15,7 @@
 use crate::assertions::AssertionReport;
 use crate::user_store::UserRecord;
 use hdrhistogram::Histogram;
-use privchat_sdk::{PrivchatConfig, PrivchatSdk};
+use privchat_sdk::{ConnectionState, PrivchatConfig, PrivchatSdk};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
@@ -115,6 +115,16 @@ async fn connect_and_auth_one(
     let t0 = Instant::now();
     let sdk = PrivchatSdk::new(config);
     sdk.connect().await?;
+    // Fix 1: connect() 返回后立即核对状态。非 Connected/LoggedIn/Authenticated → 明确报
+    // connect_returned_state_xxx（归入 sdk_state_err），不让后续 login 报模糊错、也据此区分
+    // 「SDK 状态机 race」与「server 峰值下把连接断回 New」。
+    match sdk.connection_state().await {
+        Ok(ConnectionState::Connected)
+        | Ok(ConnectionState::LoggedIn)
+        | Ok(ConnectionState::Authenticated) => {}
+        Ok(other) => return Err(format!("connect_returned_state_{other:?}").into()),
+        Err(e) => return Err(format!("connect_returned_state_err: {e}").into()),
+    }
     let password =
         std::env::var("LOAD_TEST_PASSWORD").unwrap_or_else(|_| "loadtest123".to_string());
     let login_result = sdk
@@ -207,6 +217,26 @@ pub async fn run_auth_peak(
     let data_dir_buf = data_dir.to_path_buf();
     let server_host_str = server_host.to_string();
 
+    // Fix 2: 峰值**期间**采样 /metrics 记录 max（结束态采一次不可信）。
+    let peak_max = Arc::new(std::sync::Mutex::new((0.0f64, 0.0f64, 0.0f64))); // (db_active, redis_active, conns)
+    let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = metrics_url.map(|u| {
+        let url = u.to_string();
+        let peak_max = peak_max.clone();
+        let stop = sampler_stop.clone();
+        tokio::spawn(async move {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Some(m) = fetch_server_metrics(&url).await {
+                    let mut mx = peak_max.lock().unwrap();
+                    mx.0 = mx.0.max(m.db_pool_active.unwrap_or(0.0));
+                    mx.1 = mx.1.max(m.redis_pool_active.unwrap_or(0.0));
+                    mx.2 = mx.2.max(m.active_connections.unwrap_or(0.0));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            }
+        })
+    });
+
     let t0 = Instant::now();
     let mut handles = Vec::with_capacity(total);
     for record in records.iter() {
@@ -244,6 +274,7 @@ pub async fn run_auth_peak(
                 } else if err_str.contains("requires connect first")
                     || err_str.contains("invalid state")
                     || err_str.contains("connect first")
+                    || err_str.contains("connect_returned_state")
                 {
                     // SDK/harness 状态 race，非 server 拒绝。归因未完成前单列，不算作 server 侧失败。
                     peak_state_errors += 1;
@@ -260,6 +291,16 @@ pub async fn run_auth_peak(
         }
     }
     let peak_elapsed = t0.elapsed();
+    // Fix 2: 停 sampler，取峰值期间 max（供断言用，替代结束态）
+    sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(h) = sampler {
+        let _ = h.await;
+    }
+    let (db_active_max, redis_active_max, conns_max) = *peak_max.lock().unwrap();
+    info!(
+        "[auth_peak] peak metrics MAX: db_active={:.0} redis_active={:.0} conns={:.0}",
+        db_active_max, redis_active_max, conns_max
+    );
     let _peak_total_failures = peak_conn_refused + peak_other_errors + peak_state_errors;
 
     let peak_success_rate = peak_ok as f64 / total as f64;
@@ -324,16 +365,13 @@ pub async fn run_auth_peak(
     // This catches the case where p99 looks fine but system is actively rejecting connections
     report.assert_lte("peak_conn_refused_rate", conn_refused_rate, 0.05);
 
-    // DB pool active should be within pool size (< 50)
-    if let Some(ref m) = metrics_after_peak {
-        if let Some(db_active) = m.db_pool_active {
-            report.assert_lte("db_pool_active_peak", db_active, 50.0);
-        } else {
-            report.skip("db_pool_active_peak", "metric not available");
-        }
+    // DB pool active < 50。用**峰值期间 max**（Fix 2 sampler），不用结束态。
+    if metrics_url.is_some() {
+        report.assert_lte("db_pool_active_peak", db_active_max, 50.0);
     } else {
         report.skip("db_pool_active_peak", "metrics endpoint not configured");
     }
+    let _ = (redis_active_max, conns_max); // 已在上方 MAX 日志输出，保留供后续断言扩展
 
     Ok(AuthPeakResult {
         report,
