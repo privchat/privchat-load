@@ -115,9 +115,10 @@ async fn connect_and_auth_one(
     let t0 = Instant::now();
     let sdk = PrivchatSdk::new(config);
     sdk.connect().await?;
+    let connect_ms = t0.elapsed().as_secs_f64() * 1000.0;
     // Fix 1: connect() 返回后立即核对状态。非 Connected/LoggedIn/Authenticated → 明确报
-    // connect_returned_state_xxx（归入 sdk_state_err），不让后续 login 报模糊错、也据此区分
-    // 「SDK 状态机 race」与「server 峰值下把连接断回 New」。
+    // connect_returned_state_xxx（归入 sdk_state_err），据此区分 SDK race 与 server 断回 New。
+    let ts = Instant::now();
     match sdk.connection_state().await {
         Ok(ConnectionState::Connected)
         | Ok(ConnectionState::LoggedIn)
@@ -125,18 +126,28 @@ async fn connect_and_auth_one(
         Ok(other) => return Err(format!("connect_returned_state_{other:?}").into()),
         Err(e) => return Err(format!("connect_returned_state_err: {e}").into()),
     }
+    let state_ms = ts.elapsed().as_secs_f64() * 1000.0;
     let password =
         std::env::var("LOAD_TEST_PASSWORD").unwrap_or_else(|_| "loadtest123".to_string());
+    let tl = Instant::now();
     let login_result = sdk
         .login(record.username.clone(), password, record.device_id.clone())
         .await?;
+    let login_ms = tl.elapsed().as_secs_f64() * 1000.0;
+    let ta = Instant::now();
     sdk.authenticate(
         login_result.user_id,
         login_result.token,
         login_result.device_id,
     )
     .await?;
+    let auth_ms = ta.elapsed().as_secs_f64() * 1000.0;
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // Fix C: 分段耗时日志——定位 37s 慢在 connect / state / login / authenticate 哪一段。
+    info!(
+        "[auth_peak] stage user={} connect={:.0} state={:.0} login={:.0} auth={:.0} total={:.0} ms",
+        record.username, connect_ms, state_ms, login_ms, auth_ms, elapsed_ms
+    );
 
     Ok((Arc::new(sdk), elapsed_ms))
 }
@@ -219,14 +230,17 @@ pub async fn run_auth_peak(
 
     // Fix 2: 峰值**期间**采样 /metrics 记录 max（结束态采一次不可信）。
     let peak_max = Arc::new(std::sync::Mutex::new((0.0f64, 0.0f64, 0.0f64))); // (db_active, redis_active, conns)
+    let metrics_samples = Arc::new(std::sync::atomic::AtomicU64::new(0)); // Fix A: 成功采样次数
     let sampler_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = metrics_url.map(|u| {
         let url = u.to_string();
         let peak_max = peak_max.clone();
+        let samples = metrics_samples.clone();
         let stop = sampler_stop.clone();
         tokio::spawn(async move {
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 if let Some(m) = fetch_server_metrics(&url).await {
+                    samples.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let mut mx = peak_max.lock().unwrap();
                     mx.0 = mx.0.max(m.db_pool_active.unwrap_or(0.0));
                     mx.1 = mx.1.max(m.redis_pool_active.unwrap_or(0.0));
@@ -365,13 +379,29 @@ pub async fn run_auth_peak(
     // This catches the case where p99 looks fine but system is actively rejecting connections
     report.assert_lte("peak_conn_refused_rate", conn_refused_rate, 0.05);
 
-    // DB pool active < 50。用**峰值期间 max**（Fix 2 sampler），不用结束态。
+    // Fix A: metrics_url 已配置但一次都没成功采样 → FAIL（防 URL 配错却假 PASS）。
+    let n_samples = metrics_samples.load(std::sync::atomic::Ordering::Relaxed);
     if metrics_url.is_some() {
-        report.assert_lte("db_pool_active_peak", db_active_max, 50.0);
-    } else {
-        report.skip("db_pool_active_peak", "metrics endpoint not configured");
+        report.assert_gte(
+            "metrics_sampled",
+            if n_samples > 0 { 1.0 } else { 0.0 },
+            1.0,
+        );
     }
-    let _ = (redis_active_max, conns_max); // 已在上方 MAX 日志输出，保留供后续断言扩展
+    // Fix B: db_pool gauge 是 server 60s 周期上报，峰值(数十秒)内 sampler 读到的是旧值 →
+    // db_pool_active_peak 目前只算**弱证据**，标 SKIP，不作 PASS；待改用 pg_stat_activity /
+    // server load-test 高频刷新 gauge 后再作硬断言。
+    if metrics_url.is_some() && n_samples > 0 {
+        report.skip(
+            "db_pool_active_peak",
+            &format!(
+                "弱证据(pool gauge 60s 周期,峰值读旧值); max={db_active_max:.0} 待接 pg_stat_activity"
+            ),
+        );
+    } else {
+        report.skip("db_pool_active_peak", "metrics 未配置/未采到");
+    }
+    let _ = (redis_active_max, conns_max); // 已在 MAX 日志输出，保留供后续断言扩展
 
     Ok(AuthPeakResult {
         report,
