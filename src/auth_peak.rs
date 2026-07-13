@@ -82,7 +82,7 @@ async fn fetch_server_metrics(metrics_url: &str) -> Option<ServerMetrics> {
         db_pool_idle: parse_gauge(&text, "privchat_db_pool_idle"),
         redis_pool_active: parse_gauge(&text, "privchat_redis_pool_active"),
         redis_pool_idle: parse_gauge(&text, "privchat_redis_pool_idle"),
-        active_connections: parse_gauge(&text, "privchat_active_connections"),
+        active_connections: parse_gauge(&text, "privchat_connections_current"),
     })
 }
 
@@ -220,6 +220,9 @@ pub async fn run_auth_peak(
 
     let mut peak_conn_refused = 0u64;
     let mut peak_other_errors = 0u64;
+    // SDK/harness 状态 race（如 "login requires connect first"）单独统计，
+    // 与 server refused/timeout/error 分开——归因未完成前不能混为一谈（Codex）。
+    let mut peak_state_errors = 0u64;
 
     for (i, handle) in handles.into_iter().enumerate() {
         match handle.await {
@@ -238,6 +241,13 @@ pub async fn run_auth_peak(
                 {
                     peak_conn_refused += 1;
                     warn!("[auth_peak] peak connect {} refused/timeout: {}", i, e);
+                } else if err_str.contains("requires connect first")
+                    || err_str.contains("invalid state")
+                    || err_str.contains("connect first")
+                {
+                    // SDK/harness 状态 race，非 server 拒绝。归因未完成前单列，不算作 server 侧失败。
+                    peak_state_errors += 1;
+                    warn!("[auth_peak] peak connect {} SDK-state error (归因待查): {}", i, e);
                 } else {
                     peak_other_errors += 1;
                     warn!("[auth_peak] peak connect {} failed: {}", i, e);
@@ -250,7 +260,7 @@ pub async fn run_auth_peak(
         }
     }
     let peak_elapsed = t0.elapsed();
-    let _peak_total_failures = peak_conn_refused + peak_other_errors;
+    let _peak_total_failures = peak_conn_refused + peak_other_errors + peak_state_errors;
 
     let peak_success_rate = peak_ok as f64 / total as f64;
     let peak_p99_ms = if !peak_hist.is_empty() {
@@ -264,10 +274,11 @@ pub async fn run_auth_peak(
         0.0
     };
     info!(
-        "[auth_peak] peak: {}/{} ok, refused/timeout={}, other_err={}, p99={:.2}ms, elapsed={:.2}s",
+        "[auth_peak] peak: {}/{} ok, refused/timeout={}, sdk_state_err={}, other_err={}, p99={:.2}ms, elapsed={:.2}s",
         peak_ok,
         total,
         peak_conn_refused,
+        peak_state_errors,
         peak_other_errors,
         peak_p99_ms,
         peak_elapsed.as_secs_f64()
