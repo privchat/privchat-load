@@ -518,6 +518,25 @@ async fn connect_and_token_auth_one(
     Ok((Arc::new(sdk), elapsed_ms))
 }
 
+/// jittered 到达延迟(ms)：第 `i` 个（共 `n` 个）连接的到达时刻 = 槽位 `i × 槽间隔`
+/// 叠加 **±30%×槽间隔** 的确定性抖动，clamp 到 `[0, window_ms]`。
+///
+/// - 抖动幅度相对**槽间隔**（相邻到达间隔），不随绝对时间增长；不会超出 `window_ms`。
+/// - 确定性：抖动由 `i` 的 hash 决定 → 同 `(i,n,window)` 恒定，压测可复现。
+/// - `n<=1` 或 `window_ms==0` → 0（退化为立即，等价 burst）。
+fn jittered_delay_ms(i: usize, n: usize, window_ms: u64) -> u64 {
+    if n <= 1 || window_ms == 0 {
+        return 0;
+    }
+    let window = window_ms as f64;
+    let interval = window / n as f64; // 槽间隔
+    let nominal = i as f64 * interval; // 第 i 个槽位
+    // hash(i) → [0,1) → [-1,1)，取 ±30%×interval
+    let h = ((i as u64).wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0;
+    let jitter = (h * 2.0 - 1.0) * 0.3 * interval;
+    (nominal + jitter).clamp(0.0, window) as u64
+}
+
 /// 场景：重连认证峰值。Phase1 warmup(顺序 login 拿新鲜 token) → Phase2 settle →
 /// Phase3 peak(connect + token authenticate)。
 ///
@@ -617,11 +636,9 @@ pub async fn run_reconnect_token_peak(
         let dd = data_dir_buf.clone();
         let h = host.clone();
         let p = proto.clone();
-        // 铺开延迟：base = i/N × window；±30% 确定性 jitter（hash(i)→[0,1)）去同步。
-        let delay_ms: u64 = if jittered && n_peak > 1 {
-            let base = (i as f64 / n_peak as f64) * arrival_window_ms as f64;
-            let hjit = ((i as u64).wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0;
-            (base * (0.7 + hjit * 0.6)) as u64
+        // 铺开延迟：见 jittered_delay_ms（槽位 ± 30%×槽间隔，clamp 到 [0, window]）。
+        let delay_ms: u64 = if jittered {
+            jittered_delay_ms(i, n_peak, arrival_window_ms)
         } else {
             0
         };
@@ -711,4 +728,68 @@ pub async fn run_reconnect_token_peak(
         baseline_success_rate: warmup_rate,
         peak_success_rate,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::jittered_delay_ms;
+
+    #[test]
+    fn degenerate_cases_are_zero() {
+        assert_eq!(jittered_delay_ms(0, 1, 5000), 0); // n<=1
+        assert_eq!(jittered_delay_ms(0, 0, 5000), 0);
+        assert_eq!(jittered_delay_ms(3, 50, 0), 0); // window==0
+    }
+
+    #[test]
+    fn deterministic() {
+        for i in 0..50 {
+            assert_eq!(
+                jittered_delay_ms(i, 50, 5000),
+                jittered_delay_ms(i, 50, 5000),
+                "same inputs must yield same delay (i={i})"
+            );
+        }
+    }
+
+    #[test]
+    fn never_exceeds_window() {
+        let (n, window) = (50usize, 5000u64);
+        for i in 0..n {
+            assert!(
+                jittered_delay_ms(i, n, window) <= window,
+                "delay for i={i} exceeded window"
+            );
+        }
+        // 边界：最后一个 slot 也不越界。
+        assert!(jittered_delay_ms(n - 1, n, window) <= window);
+    }
+
+    #[test]
+    fn jitter_amplitude_bounded_by_30pct_of_interval() {
+        // 每个到达都应落在其 nominal 槽位 ± 30%×槽间隔 内（clamp 前的约束在 [0,window] 内成立）。
+        let (n, window) = (50usize, 5000u64);
+        let interval = window as f64 / n as f64;
+        for i in 0..n {
+            let nominal = i as f64 * interval;
+            let delay = jittered_delay_ms(i, n, window) as f64;
+            let lo = (nominal - 0.3 * interval).max(0.0);
+            let hi = (nominal + 0.3 * interval).min(window as f64);
+            // 允许 1ms 的 f64→u64 截断误差。
+            assert!(
+                delay >= lo - 1.0 && delay <= hi + 1.0,
+                "i={i}: delay={delay} outside [{lo},{hi}]"
+            );
+        }
+    }
+
+    #[test]
+    fn arrivals_spread_across_window() {
+        // 分布性：前段小、后段接近 window（用首/尾槽位近似）。
+        let (n, window) = (50usize, 5000u64);
+        let first = jittered_delay_ms(0, n, window);
+        let last = jittered_delay_ms(n - 1, n, window);
+        assert!(first < window / 4, "first arrival should be early, got {first}");
+        assert!(last > window / 2, "last arrival should be late, got {last}");
+    }
 }

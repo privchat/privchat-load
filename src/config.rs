@@ -12,14 +12,15 @@ pub struct TestConfig {
     pub rate: RateConfig,
     #[serde(default)]
     pub run: RunConfig,
-    /// 到达模型（reconnect_token_peak / auth_peak 峰值）：burst（默认）vs jittered。
+    /// 到达模型（**仅 `reconnect_token_peak`**）：burst（默认）vs jittered。
     #[serde(default)]
     pub arrival: ArrivalConfig,
 }
 
-/// 峰值到达模型（LOAD_GATE_EXECUTION_SPEC §4）。
+/// 峰值到达模型（LOAD_GATE_EXECUTION_SPEC §4）。**目前只接入 `reconnect_token_peak`**
+/// （`auth_peak` 未接，恒为 burst）。
 /// - `burst`：一次性并发全部（worst-case，默认，行为不变）。
-/// - `jittered`：在 `window_ms` 内按 ±30% jitter 铺开到达（对齐 SDK P0-12 重连抖动）。
+/// - `jittered`：在 `window_ms` 内按 ±30%×槽间隔 jitter 铺开到达（对齐 SDK P0-12 重连抖动）。
 #[derive(Debug, Clone, Deserialize)]
 pub struct ArrivalConfig {
     #[serde(default = "default_arrival_model")]
