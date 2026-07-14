@@ -155,6 +155,38 @@ pub(crate) fn linreg_slope(xs: &[f64], ys: &[f64]) -> f64 {
     (nf * sxy - sx * sy) / denom
 }
 
+/// 稳态 RPC 错误率判定（纯函数、可测）。`Err(())` = 请求增量 < 最低期望（指标未动/缺失 → 防假绿）。
+pub(crate) fn steady_rpc_error_rate(d_ok: f64, d_err: f64, min_total: f64) -> Result<f64, ()> {
+    let total = d_ok + d_err;
+    if total < min_total {
+        return Err(());
+    }
+    Ok(d_err / total.max(1.0))
+}
+
+/// 重连探针判定（纯函数、可测），把「init 失败 / att==0(非dev) / att==0(dev)」三条假绿路径显式化。
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReconnectVerdict {
+    InitFail,
+    ZeroAttemptFail,
+    SkipDev,
+    Rate(f64),
+}
+
+pub(crate) fn reconnect_verdict(init_failed: bool, att: u64, ok: u64, is_dev: bool) -> ReconnectVerdict {
+    if init_failed {
+        return ReconnectVerdict::InitFail;
+    }
+    if att == 0 {
+        return if is_dev {
+            ReconnectVerdict::SkipDev
+        } else {
+            ReconnectVerdict::ZeroAttemptFail
+        };
+    }
+    ReconnectVerdict::Rate(ok as f64 / att as f64)
+}
+
 pub(crate) fn net_delta(values: &[f64]) -> f64 {
     let n = values.len();
     if n < 2 {
@@ -169,10 +201,9 @@ pub(crate) fn net_delta(values: &[f64]) -> f64 {
 /// server /metrics 采样。`*_found` 记录该 family 是否实际出现（缺失 → 硬失败，防假绿）。
 #[derive(Clone, Copy, Default)]
 struct SrvMetrics {
-    h_ok: f64,
-    h_error: f64,
-    h_busy: f64,
-    handler_found: bool,
+    rpc_ok: f64,
+    rpc_error: f64,
+    rpc_found: bool,
     tokio_tasks: f64,
     tokio_found: bool,
 }
@@ -189,17 +220,15 @@ async fn fetch_srv_metrics(url: &str) -> Option<SrvMetrics> {
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        // privchat_handler_requests_total{result="ok"} N
-        if line.starts_with("privchat_handler_requests_total{") {
+        // privchat_rpc_requests_total{result="ok"} N（server init 已预注册 ok/error=0）
+        if line.starts_with("privchat_rpc_requests_total{") {
             let val = line.rsplit('}').next().and_then(|s| s.trim().parse::<f64>().ok());
             if let Some(v) = val {
-                m.handler_found = true;
+                m.rpc_found = true;
                 if line.contains("result=\"ok\"") {
-                    m.h_ok += v;
+                    m.rpc_ok += v;
                 } else if line.contains("result=\"error\"") {
-                    m.h_error += v;
-                } else if line.contains("result=\"busy\"") {
-                    m.h_busy += v;
+                    m.rpc_error += v;
                 }
             }
         } else if let Some(rest) = line.strip_prefix("privchat_tokio_alive_tasks ") {
@@ -319,13 +348,13 @@ pub async fn run_soak(
         report.fail("soak_metric_tokio_present", "/metrics 缺 privchat_tokio_alive_tasks");
         return Ok(SoakResult { report });
     }
-    if !m_start.handler_found {
-        report.fail("soak_metric_handler_present", "/metrics 缺 privchat_handler_requests_total（server 需重建）");
+    if !m_start.rpc_found {
+        report.fail("soak_metric_rpc_present", "/metrics 缺 privchat_rpc_requests_total（server 需重建含预注册）");
         return Ok(SoakResult { report });
     }
     info!(
-        "[soak] profile={} duration={}s warmup={}s msg_per_sec={} users={} pid={} rss0={:.1}MB tasks0={} h_ok0={} h_err0={}",
-        profile.label(), duration_sec, warmup_sec, msg_per_sec, records.len(), pid, rss0, m_start.tokio_tasks, m_start.h_ok, m_start.h_error
+        "[soak] profile={} duration={}s warmup={}s msg_per_sec={} users={} pid={} rss0={:.1}MB tasks0={} rpc_ok0={} rpc_err0={}",
+        profile.label(), duration_sec, warmup_sec, msg_per_sec, records.len(), pid, rss0, m_start.tokio_tasks, m_start.rpc_ok, m_start.rpc_error
     );
 
     // === 1. 建 N 个认证连接 ===
@@ -374,10 +403,12 @@ pub async fn run_soak(
     info!("[soak] group {} created, {}/{} joined", group_id, joined, user_ids.len());
 
     // === 真 token 重连探针（§3.1 重连成功率）===
-    // 建**一个已认证** probe（独立 device_id/dir，不踢保活连接），周期 disconnect(掉 transport)
-    // 再 connect(原 token 自动重连，非重新 password login)，验证恢复为 Authenticated（会话/状态机正确）。
+    // 建**一个已认证** probe（独立 device_id/dir，不踢保活连接）。每轮：要求 disconnect() 成功且确认
+    // transport 已断（!is_connected）→ connect()（原 token 自动重连）→ 断言 Authenticated →
+    // **再跑一次真认证 RPC（submit 到群）**确认会话真恢复（不只信内存 ConnectionState）。任一步失败该轮不计成功。
     let reconn_ok = Arc::new(AtomicU64::new(0));
     let reconn_att = Arc::new(AtomicU64::new(0));
+    let probe_init_failed = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
     let probe = {
         let mut r = records[0].clone();
@@ -385,12 +416,14 @@ pub async fn run_soak(
         let dd = data_dir.to_path_buf();
         let host = server_host.to_string();
         let proto = server_protocol.to_string();
-        let (ok, att, st) = (reconn_ok.clone(), reconn_att.clone(), stop.clone());
+        let gid = group_id;
+        let (ok, att, st, initf) = (reconn_ok.clone(), reconn_att.clone(), stop.clone(), probe_init_failed.clone());
         tokio::spawn(async move {
             let sdk = match connect_login_auth(&r, &dd, "soak_probe", &host, server_port, &proto).await {
                 Ok(s) => s,
                 Err(e) => {
                     warn!("[soak] reconnect probe initial auth failed: {e}");
+                    initf.store(true, Ordering::Relaxed);
                     return;
                 }
             };
@@ -402,15 +435,34 @@ pub async fn run_soak(
                     break;
                 }
                 att.fetch_add(1, Ordering::Relaxed);
-                let _ = sdk.disconnect().await;
-                match sdk.connect().await {
-                    Ok(_) => match sdk.connection_state().await {
-                        Ok(privchat_sdk::ConnectionState::Authenticated) => {
-                            ok.fetch_add(1, Ordering::Relaxed);
-                        }
-                        other => warn!("[soak] reconnect state != Authenticated: {other:?}"),
-                    },
-                    Err(e) => warn!("[soak] reconnect connect failed: {e}"),
+                // 1) 必须真断开
+                if sdk.disconnect().await.is_err() || sdk.is_connected().await.unwrap_or(true) {
+                    warn!("[soak] reconnect: disconnect 未成功/未断开，不计成功");
+                    continue;
+                }
+                // 2) 原 token 重连 + Authenticated
+                if let Err(e) = sdk.connect().await {
+                    warn!("[soak] reconnect connect failed: {e}");
+                    continue;
+                }
+                if !matches!(sdk.connection_state().await, Ok(privchat_sdk::ConnectionState::Authenticated)) {
+                    warn!("[soak] reconnect state != Authenticated");
+                    continue;
+                }
+                // 3) 恢复后跑真认证 RPC（submit 到群），成功才算真重连成功。
+                let probe_req = ClientSubmitRequest {
+                    local_message_id: next_local_message_id(),
+                    channel_id: gid,
+                    channel_type: 2,
+                    last_pts: 0,
+                    command_type: "send_message".to_string(),
+                    payload: serde_json::json!({"content": "soak_reconnect_probe", "message_type": 0}),
+                    client_timestamp: chrono::Utc::now().timestamp_millis(),
+                    device_id: None,
+                };
+                match rpc_call_typed::<_, ClientSubmitResponse>(&sdk, routes::sync::SUBMIT, &probe_req).await {
+                    Ok(_) => { ok.fetch_add(1, Ordering::Relaxed); }
+                    Err(e) => warn!("[soak] reconnect post-auth RPC failed: {e}"),
                 }
             }
             sdk.shutdown().await;
@@ -432,6 +484,8 @@ pub async fn run_soak(
     sample_tick.tick().await;
     let mut sent = 0u64;
     let mut send_err = 0u64;
+    // 稳态 RPC 计数基线：在 warmup 结束后的**第一个**采样点捕获（不含连接/登录/建群初始化期）。
+    let mut steady_rpc_base: Option<(f64, f64)> = None;
     loop {
         tokio::select! {
             _ = send_tick.tick() => {
@@ -456,10 +510,15 @@ pub async fn run_soak(
                 let t = start.elapsed().as_secs_f64();
                 let rss = rss_mb_of(&pid);
                 let fd = server_fd_count(&pid);
-                let tasks = fetch_srv_metrics(&murl).await.map(|m| m.tokio_tasks).unwrap_or(0.0);
-                if rss <= 0.0 || fd.is_none() || tasks <= 0.0 {
+                let sm = fetch_srv_metrics(&murl).await;
+                let tasks = sm.map(|m| m.tokio_tasks).unwrap_or(0.0);
+                let rpc_ok = sm.map(|m| m.rpc_found).unwrap_or(false);
+                if rss <= 0.0 || fd.is_none() || tasks <= 0.0 || !rpc_ok {
                     invalid_sample = true;
-                    warn!("[soak] t={:.0}s INVALID sample rss={:.1} fd={:?} tasks={}", t, rss, fd, tasks);
+                    warn!("[soak] t={:.0}s INVALID sample rss={:.1} fd={:?} tasks={} rpc_found={}", t, rss, fd, tasks, rpc_ok);
+                }
+                if steady_rpc_base.is_none() && t >= warmup_sec as f64 {
+                    if let Some(m) = sm { steady_rpc_base = Some((m.rpc_ok, m.rpc_error)); }
                 }
                 samples.push((t, rss, fd, tasks));
                 info!("[soak] t={:.0}s rss={:.1}MB fd={:?} tasks={} sent={} err={}", t, rss, fd, tasks, sent, send_err);
@@ -516,24 +575,25 @@ pub async fn run_soak(
     let task_net_pct = net_delta(&s_tasks) / task_base;
     report.assert_lte("soak_tokio_task_net_pct", task_net_pct, profile.tokio_task_net_pct_max());
 
-    // handler 真错误率（稳态 Δerror/(Δok+Δerror+Δbusy)，覆盖普通/认证/同步/业务错误 code!=0）
-    match m_end {
-        Some(me) if me.handler_found => {
-            let d_ok = (me.h_ok - m_start.h_ok).max(0.0);
-            let d_err = (me.h_error - m_start.h_error).max(0.0);
-            let d_busy = (me.h_busy - m_start.h_busy).max(0.0);
-            let d_total = d_ok + d_err + d_busy;
-            info!("[soak] handler: Δok={:.0} Δerror={:.0} Δbusy={:.0}", d_ok, d_err, d_busy);
-            // 请求增量必须与发送量匹配，否则=指标没在动/采样失效 → 硬失败（防缺失假绿）。
-            let min_expected = (sent as f64 * 0.5).max(10.0);
-            if d_total < min_expected {
-                report.fail("soak_handler_requests_delta", &format!("handler 请求增量 {d_total:.0} < 预期 {min_expected:.0}（指标未动?）"));
-            } else {
-                report.assert_lte("soak_handler_error_rate", d_err / d_total, 0.001);
+    // RPC 真错误率（**稳态段** Δerror/(Δok+Δerror)，作用域=RPC dispatch，code!=0 计 error）。
+    // 基线取 warmup 结束点（steady_rpc_base），排除连接/登录/建群初始化期。
+    match (m_end, steady_rpc_base) {
+        (Some(me), Some((base_ok, base_err))) if me.rpc_found => {
+            let d_ok = (me.rpc_ok - base_ok).max(0.0);
+            let d_err = (me.rpc_error - base_err).max(0.0);
+            let d_total = d_ok + d_err;
+            info!("[soak] rpc steady: Δok={:.0} Δerror={:.0}", d_ok, d_err);
+            let _ = d_total;
+            // 请求增量必须与稳态发送量匹配，否则=指标没在动/采样失效 → 硬失败（防缺失假绿）。
+            let min_expected = (sent as f64 * 0.4).max(10.0);
+            match steady_rpc_error_rate(d_ok, d_err, min_expected) {
+                Ok(rate) => report.assert_lte("soak_rpc_error_rate", rate, 0.001),
+                Err(()) => report.fail("soak_rpc_requests_delta", &format!("稳态 RPC 增量 {:.0} < 预期 {min_expected:.0}（指标未动?）", d_ok + d_err)),
             }
         }
-        Some(_) => report.fail("soak_handler_error_rate", "结束 /metrics 缺 handler_requests_total"),
-        None => report.fail("soak_handler_error_rate", "结束拉不到 /metrics"),
+        (Some(me), _) if !me.rpc_found => report.fail("soak_rpc_error_rate", "结束 /metrics 缺 rpc_requests_total"),
+        (Some(_), None) => report.fail("soak_rpc_error_rate", "未捕获 warmup-end RPC 基线（稳态样本不足）"),
+        _ => report.fail("soak_rpc_error_rate", "结束拉不到 /metrics"),
     }
 
     // submit ACK RTT p99 末段较首段劣化 < 20%。
@@ -567,14 +627,15 @@ pub async fn run_soak(
         report.fail("soak_delivery_p99_end_to_end", "未实现真端到端 delivery p99（§3.1 必需，G10 剩余项）");
     }
 
-    // 周期重连成功率 > 99%
+    // 周期重连成功率 > 99%（三条假绿路径显式化，见 reconnect_verdict）
     let att = reconn_att.load(Ordering::Relaxed);
     let ok = reconn_ok.load(Ordering::Relaxed);
-    if att > 0 {
-        info!("[soak] reconnect probe: {}/{} ok", ok, att);
-        report.assert_gte("soak_reconnect_success_rate", ok as f64 / att as f64, 0.99);
-    } else {
-        report.skip("soak_reconnect_success_rate", "无重连尝试(duration 太短)");
+    info!("[soak] reconnect probe: {}/{} ok", ok, att);
+    match reconnect_verdict(probe_init_failed.load(Ordering::Relaxed), att, ok, profile == SoakProfile::Dev) {
+        ReconnectVerdict::InitFail => report.fail("soak_reconnect_probe_init", "重连 probe 初始认证失败"),
+        ReconnectVerdict::ZeroAttemptFail => report.fail("soak_reconnect_success_rate", "smoke/gate 期间 0 次重连尝试（异常）"),
+        ReconnectVerdict::SkipDev => report.skip("soak_reconnect_success_rate", "dev duration 太短无重连尝试"),
+        ReconnectVerdict::Rate(rate) => report.assert_gte("soak_reconnect_success_rate", rate, 0.99),
     }
 
     // 连接存活
@@ -622,5 +683,34 @@ mod tests {
         assert!(net_delta(&[100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0]) > 50.0);
         assert!(net_delta(&[50.0, 50.4, 49.8, 50.1, 49.9, 50.2, 50.0, 49.7]).abs() < 2.0);
         assert_eq!(net_delta(&[42.0]), 0.0);
+    }
+
+    // 防假绿分支：RPC 错误率
+    #[test]
+    fn steady_rpc_error_rate_branches() {
+        use super::steady_rpc_error_rate;
+        // 零增量/不足 → Err（指标未动/缺失，不能假绿）
+        assert!(steady_rpc_error_rate(0.0, 0.0, 10.0).is_err());
+        assert!(steady_rpc_error_rate(3.0, 0.0, 10.0).is_err());
+        // 足够增量 + 全 ok → 0 错误率
+        assert_eq!(steady_rpc_error_rate(100.0, 0.0, 10.0), Ok(0.0));
+        // 有错误 → 正确比率
+        let r = steady_rpc_error_rate(90.0, 10.0, 10.0).unwrap();
+        assert!((r - 0.1).abs() < 1e-9);
+    }
+
+    // 防假绿分支：重连判定
+    #[test]
+    fn reconnect_verdict_branches() {
+        use super::{reconnect_verdict, ReconnectVerdict};
+        // init 失败 → InitFail（不可当通过）
+        assert_eq!(reconnect_verdict(true, 0, 0, false), ReconnectVerdict::InitFail);
+        assert_eq!(reconnect_verdict(true, 5, 5, true), ReconnectVerdict::InitFail);
+        // att==0：非 dev → 硬失败；dev → skip
+        assert_eq!(reconnect_verdict(false, 0, 0, false), ReconnectVerdict::ZeroAttemptFail);
+        assert_eq!(reconnect_verdict(false, 0, 0, true), ReconnectVerdict::SkipDev);
+        // 正常比率
+        assert_eq!(reconnect_verdict(false, 10, 10, false), ReconnectVerdict::Rate(1.0));
+        assert_eq!(reconnect_verdict(false, 10, 9, false), ReconnectVerdict::Rate(0.9));
     }
 }
