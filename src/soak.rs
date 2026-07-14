@@ -166,12 +166,15 @@ pub(crate) fn net_delta(values: &[f64]) -> f64 {
     last - first
 }
 
-/// server /metrics 采样（handler 拒绝数 / rpc 总数 / tokio 存活 task 数）。
+/// server /metrics 采样。`*_found` 记录该 family 是否实际出现（缺失 → 硬失败，防假绿）。
 #[derive(Clone, Copy, Default)]
 struct SrvMetrics {
-    handler_rejected: f64,
-    rpc_total: f64,
+    h_ok: f64,
+    h_error: f64,
+    h_busy: f64,
+    handler_found: bool,
     tokio_tasks: f64,
+    tokio_found: bool,
 }
 
 async fn fetch_srv_metrics(url: &str) -> Option<SrvMetrics> {
@@ -186,14 +189,24 @@ async fn fetch_srv_metrics(url: &str) -> Option<SrvMetrics> {
         if line.starts_with('#') || line.is_empty() {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("privchat_handler_rejected_total ") {
-            m.handler_rejected = rest.trim().parse().unwrap_or(m.handler_rejected);
-        } else if line.starts_with("privchat_rpc_total{") {
-            if let Some(v) = line.rsplit('}').next().and_then(|s| s.trim().parse::<f64>().ok()) {
-                m.rpc_total += v;
+        // privchat_handler_requests_total{result="ok"} N
+        if line.starts_with("privchat_handler_requests_total{") {
+            let val = line.rsplit('}').next().and_then(|s| s.trim().parse::<f64>().ok());
+            if let Some(v) = val {
+                m.handler_found = true;
+                if line.contains("result=\"ok\"") {
+                    m.h_ok += v;
+                } else if line.contains("result=\"error\"") {
+                    m.h_error += v;
+                } else if line.contains("result=\"busy\"") {
+                    m.h_busy += v;
+                }
             }
         } else if let Some(rest) = line.strip_prefix("privchat_tokio_alive_tasks ") {
-            m.tokio_tasks = rest.trim().parse().unwrap_or(m.tokio_tasks);
+            if let Ok(v) = rest.trim().parse::<f64>() {
+                m.tokio_tasks = v;
+                m.tokio_found = true;
+            }
         }
     }
     Some(m)
@@ -301,9 +314,18 @@ pub async fn run_soak(
             return Ok(SoakResult { report });
         }
     };
+    // 缺 metric family → 硬失败（防"指标缺失也 PASS"）。
+    if !m_start.tokio_found {
+        report.fail("soak_metric_tokio_present", "/metrics 缺 privchat_tokio_alive_tasks");
+        return Ok(SoakResult { report });
+    }
+    if !m_start.handler_found {
+        report.fail("soak_metric_handler_present", "/metrics 缺 privchat_handler_requests_total（server 需重建）");
+        return Ok(SoakResult { report });
+    }
     info!(
-        "[soak] profile={} duration={}s warmup={}s msg_per_sec={} users={} pid={} rss0={:.1}MB tasks0={}",
-        profile.label(), duration_sec, warmup_sec, msg_per_sec, records.len(), pid, rss0, m_start.tokio_tasks
+        "[soak] profile={} duration={}s warmup={}s msg_per_sec={} users={} pid={} rss0={:.1}MB tasks0={} h_ok0={} h_err0={}",
+        profile.label(), duration_sec, warmup_sec, msg_per_sec, records.len(), pid, rss0, m_start.tokio_tasks, m_start.h_ok, m_start.h_error
     );
 
     // === 1. 建 N 个认证连接 ===
@@ -351,34 +373,47 @@ pub async fn run_soak(
     report.assert_gte("soak_member_join_rate", joined as f64 / user_ids.len().max(1) as f64, 0.90);
     info!("[soak] group {} created, {}/{} joined", group_id, joined, user_ids.len());
 
-    // === 周期重连探针（§3.1 重连成功率）===
+    // === 真 token 重连探针（§3.1 重连成功率）===
+    // 建**一个已认证** probe（独立 device_id/dir，不踢保活连接），周期 disconnect(掉 transport)
+    // 再 connect(原 token 自动重连，非重新 password login)，验证恢复为 Authenticated（会话/状态机正确）。
     let reconn_ok = Arc::new(AtomicU64::new(0));
     let reconn_att = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let probe = {
-        let rec = records[0].clone();
+        let mut r = records[0].clone();
+        r.device_id = uuid::Uuid::new_v4().to_string();
         let dd = data_dir.to_path_buf();
         let host = server_host.to_string();
         let proto = server_protocol.to_string();
         let (ok, att, st) = (reconn_ok.clone(), reconn_att.clone(), stop.clone());
         tokio::spawn(async move {
-            let mut seq = 0u64;
+            let sdk = match connect_login_auth(&r, &dd, "soak_probe", &host, server_port, &proto).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("[soak] reconnect probe initial auth failed: {e}");
+                    return;
+                }
+            };
             let mut tick = interval(Duration::from_secs(30));
             tick.tick().await;
             while !st.load(Ordering::Relaxed) {
                 tick.tick().await;
-                if st.load(Ordering::Relaxed) { break; }
-                seq += 1;
-                // 独立 device_id + 独立 dir，避免踢掉保活连接。
-                let mut r = rec.clone();
-                r.device_id = uuid::Uuid::new_v4().to_string();
-                let sub = format!("soak_probe/{seq}");
+                if st.load(Ordering::Relaxed) {
+                    break;
+                }
                 att.fetch_add(1, Ordering::Relaxed);
-                match connect_login_auth(&r, &dd, &sub, &host, server_port, &proto).await {
-                    Ok(sdk) => { ok.fetch_add(1, Ordering::Relaxed); sdk.shutdown().await; }
-                    Err(e) => warn!("[soak] reconnect probe {} failed: {}", seq, e),
+                let _ = sdk.disconnect().await;
+                match sdk.connect().await {
+                    Ok(_) => match sdk.connection_state().await {
+                        Ok(privchat_sdk::ConnectionState::Authenticated) => {
+                            ok.fetch_add(1, Ordering::Relaxed);
+                        }
+                        other => warn!("[soak] reconnect state != Authenticated: {other:?}"),
+                    },
+                    Err(e) => warn!("[soak] reconnect connect failed: {e}"),
                 }
             }
+            sdk.shutdown().await;
         })
     };
 
@@ -456,11 +491,11 @@ pub async fn run_soak(
     let s_ts: Vec<f64> = steady.iter().map(|s| s.0).collect();
     let s_rss: Vec<f64> = steady.iter().map(|s| s.1).collect();
 
-    // RSS 净增长 + 末段趋平（稳态跨度≥60min 取固定末 30min，否则末 ½）
+    // RSS 净增长 + 末段趋平（§3.1「末 30min」：稳态跨度≥30min 即取固定末 30min，否则末 ½）
     let rss_net = net_delta(&s_rss);
     report.assert_lte("soak_rss_net_growth_mb", rss_net, profile.rss_net_max_mb());
     let span = s_ts.last().unwrap() - s_ts.first().unwrap();
-    let tail_window = if span >= 3600.0 { 1800.0 } else { span / 2.0 };
+    let tail_window = if span >= 1800.0 { 1800.0 } else { span / 2.0 };
     let tail_start = s_ts.last().unwrap() - tail_window;
     let tail_ts: Vec<f64> = s_ts.iter().cloned().filter(|t| *t >= tail_start).collect();
     let tail_rss: Vec<f64> = steady.iter().filter(|s| s.0 >= tail_start).map(|s| s.1).collect();
@@ -481,18 +516,30 @@ pub async fn run_soak(
     let task_net_pct = net_delta(&s_tasks) / task_base;
     report.assert_lte("soak_tokio_task_net_pct", task_net_pct, profile.tokio_task_net_pct_max());
 
-    // handler 错误率（稳态 Δrejected/Δrpc_total）
-    if let Some(me) = m_end {
-        let d_rej = (me.handler_rejected - m_start.handler_rejected).max(0.0);
-        let d_rpc = (me.rpc_total - m_start.rpc_total).max(0.0);
-        let err_rate = if d_rpc > 0.0 { d_rej / d_rpc } else { 0.0 };
-        info!("[soak] handler err: Δrejected={:.0} Δrpc={:.0} rate={:.4}%", d_rej, d_rpc, err_rate * 100.0);
-        report.assert_lte("soak_handler_error_rate", err_rate, 0.001);
-    } else {
-        report.fail("soak_handler_error_rate", "结束拉不到 /metrics");
+    // handler 真错误率（稳态 Δerror/(Δok+Δerror+Δbusy)，覆盖普通/认证/同步/业务错误 code!=0）
+    match m_end {
+        Some(me) if me.handler_found => {
+            let d_ok = (me.h_ok - m_start.h_ok).max(0.0);
+            let d_err = (me.h_error - m_start.h_error).max(0.0);
+            let d_busy = (me.h_busy - m_start.h_busy).max(0.0);
+            let d_total = d_ok + d_err + d_busy;
+            info!("[soak] handler: Δok={:.0} Δerror={:.0} Δbusy={:.0}", d_ok, d_err, d_busy);
+            // 请求增量必须与发送量匹配，否则=指标没在动/采样失效 → 硬失败（防缺失假绿）。
+            let min_expected = (sent as f64 * 0.5).max(10.0);
+            if d_total < min_expected {
+                report.fail("soak_handler_requests_delta", &format!("handler 请求增量 {d_total:.0} < 预期 {min_expected:.0}（指标未动?）"));
+            } else {
+                report.assert_lte("soak_handler_error_rate", d_err / d_total, 0.001);
+            }
+        }
+        Some(_) => report.fail("soak_handler_error_rate", "结束 /metrics 缺 handler_requests_total"),
+        None => report.fail("soak_handler_error_rate", "结束拉不到 /metrics"),
     }
 
-    // delivery(submit往返) p99 末段较首段劣化 < 20%
+    // submit ACK RTT p99 末段较首段劣化 < 20%。
+    // ⚠️ 这是 sender `sync/submit` 往返（server 收到并 ACK），**不是端到端 delivery**（不含 fanout
+    // 到接收端 + 事件到达）。§3.1 的真 delivery p99 待实现（recipient 用 server_msg_id↔
+    // TimelineUpdated.message_id 关联 + 丢投递计失败）。故此处名为 submit_ack，不冒充 delivery。
     let post_deliver: Vec<&(f64, u64)> = deliver.iter().filter(|(t, _)| *t >= warmup_sec as f64).collect();
     let dn = post_deliver.len();
     if dn >= 20 && (!profile.require_delivery_n() || dn >= 10000) {
@@ -505,12 +552,19 @@ pub async fn run_soak(
         let p1 = h1.value_at_quantile(0.99) as f64;
         let p2 = h2.value_at_quantile(0.99) as f64;
         let degr = if p1 > 0.0 { (p2 - p1) / p1 } else { 0.0 };
-        info!("[soak] delivery p99: first={:.0}us last={:.0}us degradation={:.1}% (n={})", p1, p2, degr * 100.0, dn);
-        report.assert_lte("soak_delivery_p99_degradation", degr, 0.20);
+        info!("[soak] submit_ack p99: first={:.0}us last={:.0}us degradation={:.1}% (n={})", p1, p2, degr * 100.0, dn);
+        report.assert_lte("soak_submit_ack_p99_degradation", degr, 0.20);
     } else if profile.require_delivery_n() {
-        report.fail("soak_delivery_p99_degradation", &format!("gate 需 delivery n≥10000，实际 {dn}"));
+        report.fail("soak_submit_ack_p99_degradation", &format!("gate 需 n≥10000，实际 {dn}"));
     } else {
-        report.skip("soak_delivery_p99_degradation", &format!("样本 {dn} 不足(smoke/dev)"));
+        report.skip("soak_submit_ack_p99_degradation", &format!("样本 {dn} 不足(smoke/dev)"));
+    }
+    // 真 end-to-end delivery p99：未实现。gate/smoke **硬失败**（§3.1 必需，缺它 G10 不能判绿）；
+    // dev 仅记录（runner 验证允许展示已实现指标）。绝不 skip（skip 会被 all_passed 当通过）。
+    if profile == SoakProfile::Dev {
+        info!("[soak] NOTE: 真端到端 delivery p99 未实现（§3.1 剩余项）；dev 不因此失败，但 G10 gate 需补它");
+    } else {
+        report.fail("soak_delivery_p99_end_to_end", "未实现真端到端 delivery p99（§3.1 必需，G10 剩余项）");
     }
 
     // 周期重连成功率 > 99%
