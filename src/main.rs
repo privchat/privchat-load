@@ -187,6 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // soak（G10）：自管连接周期 + 长时采样，跳过预建 SDK。
     if scenario_type == ScenarioType::Soak {
+        let soak_metrics_url = std::env::var("LOAD_TEST_METRICS_URL").ok();
         let result = soak::run_soak(
             &records,
             &data_dir,
@@ -196,6 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.run.duration_sec,
             config.rate.msg_per_sec,
             config.run.warmup_sec,
+            soak_metrics_url.as_deref(),
         )
         .await?;
         println!("\n============ soak result ============");
