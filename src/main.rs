@@ -157,6 +157,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.server.port,
             &server_protocol,
             metrics_url.as_deref(),
+            config.arrival.is_jittered(),
+            config.arrival.window_ms,
         )
         .await?;
 

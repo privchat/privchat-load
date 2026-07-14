@@ -12,6 +12,53 @@ pub struct TestConfig {
     pub rate: RateConfig,
     #[serde(default)]
     pub run: RunConfig,
+    /// 到达模型（reconnect_token_peak / auth_peak 峰值）：burst（默认）vs jittered。
+    #[serde(default)]
+    pub arrival: ArrivalConfig,
+}
+
+/// 峰值到达模型（LOAD_GATE_EXECUTION_SPEC §4）。
+/// - `burst`：一次性并发全部（worst-case，默认，行为不变）。
+/// - `jittered`：在 `window_ms` 内按 ±30% jitter 铺开到达（对齐 SDK P0-12 重连抖动）。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArrivalConfig {
+    #[serde(default = "default_arrival_model")]
+    pub model: String,
+    #[serde(default = "default_arrival_window_ms")]
+    pub window_ms: u64,
+}
+
+impl Default for ArrivalConfig {
+    fn default() -> Self {
+        Self {
+            model: default_arrival_model(),
+            window_ms: default_arrival_window_ms(),
+        }
+    }
+}
+
+impl ArrivalConfig {
+    /// 是否 jittered；未知 model fail-fast（与 protocol/scenario 一致，不静默）。
+    pub fn is_jittered(&self) -> bool {
+        match self.model.as_str() {
+            "burst" => false,
+            "jittered" => true,
+            other => {
+                eprintln!(
+                    "[load] FATAL: unknown arrival.model {other:?} — expected burst|jittered"
+                );
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn default_arrival_model() -> String {
+    "burst".to_string()
+}
+
+fn default_arrival_window_ms() -> u64 {
+    5000
 }
 
 #[derive(Debug, Clone, Deserialize)]

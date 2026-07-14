@@ -55,6 +55,8 @@ privchat-load/
 | | `msg_per_sec` | `500` | 每秒发送消息数 |
 | `[run]` | `duration_sec` | `60` | 测试持续时间（秒） |
 | | `warmup_sec` | `0` | 预热时间（不计入统计） |
+| `[arrival]` | `model` | `"burst"` | 峰值到达模型（仅 `reconnect_token_peak`/`auth_peak`）：`burst`=一次性并发全部；`jittered`=在窗口内 ±30% 抖动铺开 |
+| | `window_ms` | `5000` | `jittered` 时的到达窗口（毫秒） |
 
 ### 环境变量
 

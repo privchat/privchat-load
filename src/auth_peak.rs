@@ -519,7 +519,10 @@ async fn connect_and_token_auth_one(
 }
 
 /// 场景：重连认证峰值。Phase1 warmup(顺序 login 拿新鲜 token) → Phase2 settle →
-/// Phase3 peak(全部并发 connect + token authenticate)。
+/// Phase3 peak(connect + token authenticate)。
+///
+/// `jittered`=false → worst-case burst（一次性并发全部）；true → 在 `arrival_window_ms`
+/// 内按 ±30% 确定性 jitter 铺开到达（jittered-realistic，LOAD_GATE_EXECUTION_SPEC §4）。
 pub async fn run_reconnect_token_peak(
     records: &[UserRecord],
     data_dir: &Path,
@@ -527,6 +530,8 @@ pub async fn run_reconnect_token_peak(
     server_port: u16,
     server_protocol: &str,
     metrics_url: Option<&str>,
+    jittered: bool,
+    arrival_window_ms: u64,
 ) -> Result<AuthPeakResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut report = AssertionReport::new();
     let total = records.len();
@@ -595,16 +600,35 @@ pub async fn run_reconnect_token_peak(
     let host = server_host.to_string();
     let proto = server_protocol.to_string();
     let t0 = Instant::now();
-    // 注意：峰值**故意**一次性并发 spawn 全部 N 个（= 最坏情况 reconnect 突发），并发度 =
-    // `users.total`，**不受 `rate.connect_concurrent` 约束**（该项只作用于 group_broadcast 系
-    // 场景）。要调峰值并发就改 users.total。
-    let mut handles = Vec::with_capacity(creds_list.len());
-    for creds in creds_list.iter() {
+    // 到达模型（LOAD_GATE_EXECUTION_SPEC §4）：
+    //  - burst（默认）：一次性并发 spawn 全部 N 个（最坏情况 reconnect 突发）。
+    //  - jittered：在 arrival_window_ms 内按 ±30% **确定性** jitter 铺开到达（可复现）。
+    // 并发度上限 = `users.total`（不受 `rate.connect_concurrent` 约束；调并发改 users.total）。
+    let n_peak = creds_list.len();
+    info!(
+        "[reconnect_token] arrival model = {} (window={}ms, N={})",
+        if jittered { "jittered" } else { "burst" },
+        if jittered { arrival_window_ms } else { 0 },
+        n_peak
+    );
+    let mut handles = Vec::with_capacity(n_peak);
+    for (i, creds) in creds_list.iter().enumerate() {
         let creds = creds.clone();
         let dd = data_dir_buf.clone();
         let h = host.clone();
         let p = proto.clone();
+        // 铺开延迟：base = i/N × window；±30% 确定性 jitter（hash(i)→[0,1)）去同步。
+        let delay_ms: u64 = if jittered && n_peak > 1 {
+            let base = (i as f64 / n_peak as f64) * arrival_window_ms as f64;
+            let hjit = ((i as u64).wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0;
+            (base * (0.7 + hjit * 0.6)) as u64
+        } else {
+            0
+        };
         handles.push(tokio::spawn(async move {
+            if delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
             connect_and_token_auth_one(&creds, &dd, &h, server_port, &p).await
         }));
     }
