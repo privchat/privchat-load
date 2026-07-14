@@ -72,6 +72,16 @@ impl AssertionReport {
         });
     }
 
+    /// 显式硬失败（无阈值语义，用于「前置条件不满足即 FAIL」，如无效 server PID）。
+    pub fn fail(&mut self, name: &str, reason: &str) {
+        self.results.push(AssertionResult {
+            name: name.to_string(),
+            status: AssertionStatus::Fail,
+            actual: reason.to_string(),
+            threshold: "-".to_string(),
+        });
+    }
+
     /// 跳过（条件不满足时不执行断言）
     pub fn skip(&mut self, name: &str, reason: &str) {
         self.results.push(AssertionResult {

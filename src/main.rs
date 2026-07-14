@@ -194,6 +194,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.server.port,
             &server_protocol,
             config.run.duration_sec,
+            config.rate.msg_per_sec,
+            config.run.warmup_sec,
         )
         .await?;
         println!("\n============ soak result ============");
