@@ -470,7 +470,8 @@ pub async fn run_scenario(
         ScenarioType::SemanticVerify
         | ScenarioType::Backpressure
         | ScenarioType::AuthPeak
-        | ScenarioType::ReconnectTokenPeak => {
+        | ScenarioType::ReconnectTokenPeak
+        | ScenarioType::Soak => {
             // Handled separately in main.rs
             Ok(ScenarioStats::default())
         }

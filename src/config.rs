@@ -104,6 +104,7 @@ impl ScenarioConfig {
             // （connect + token authenticate，无 bcrypt）。G8 拆两场景，见各自 run_*。
             "auth_peak" | "auth_peak_login" => ScenarioType::AuthPeak,
             "reconnect_token_peak" => ScenarioType::ReconnectTokenPeak,
+            "soak" => ScenarioType::Soak,
             // scenario typo 同样 fail-fast（与未知 protocol 一致），不静默跑错场景。
             other => {
                 eprintln!(
@@ -130,6 +131,8 @@ pub enum ScenarioType {
     AuthPeak,
     /// 重连风暴：warmup 拿 token → 峰值 connect + token authenticate（无 bcrypt，真实 reconnect 路径）。
     ReconnectTokenPeak,
+    /// G10 soak：长时持续负载检测 server RSS/FD 无持续单调上涨（泄漏）。
+    Soak,
 }
 
 #[derive(Debug, Clone, Deserialize)]

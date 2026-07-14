@@ -11,6 +11,7 @@ mod backpressure;
 mod config;
 mod scenario;
 mod semantic;
+mod soak;
 mod user_store;
 
 use assertions::AssertionReport;
@@ -177,6 +178,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let report = result.report;
         report.print();
 
+        if !report.all_passed() {
+            eprintln!("{} assertions failed, exit code 1", report.fail_count());
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // soak（G10）：自管连接周期 + 长时采样，跳过预建 SDK。
+    if scenario_type == ScenarioType::Soak {
+        let result = soak::run_soak(
+            &records,
+            &data_dir,
+            &config.server.host,
+            config.server.port,
+            &server_protocol,
+            config.run.duration_sec,
+        )
+        .await?;
+        println!("\n============ soak result ============");
+        println!("=====================================\n");
+        let report = result.report;
+        report.print();
         if !report.all_passed() {
             eprintln!("{} assertions failed, exit code 1", report.fail_count());
             std::process::exit(1);
