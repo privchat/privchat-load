@@ -257,6 +257,7 @@ pub async fn run_auth_peak(
     });
 
     let t0 = Instant::now();
+    // 峰值一次性并发 spawn 全部 N 个（并发度 = users.total，不受 rate.connect_concurrent 约束）。
     let mut handles = Vec::with_capacity(total);
     for record in records.iter() {
         let record = record.clone();
@@ -594,6 +595,9 @@ pub async fn run_reconnect_token_peak(
     let host = server_host.to_string();
     let proto = server_protocol.to_string();
     let t0 = Instant::now();
+    // 注意：峰值**故意**一次性并发 spawn 全部 N 个（= 最坏情况 reconnect 突发），并发度 =
+    // `users.total`，**不受 `rate.connect_concurrent` 约束**（该项只作用于 group_broadcast 系
+    // 场景）。要调峰值并发就改 users.total。
     let mut handles = Vec::with_capacity(creds_list.len());
     for creds in creds_list.iter() {
         let creds = creds.clone();

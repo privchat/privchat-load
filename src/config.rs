@@ -45,6 +45,7 @@ pub struct ScenarioConfig {
 impl ScenarioConfig {
     pub fn scenario_type(&self) -> ScenarioType {
         match self.type_.as_str() {
+            "group_broadcast" => ScenarioType::GroupBroadcast,
             "friend_flow" => ScenarioType::FriendFlow,
             "private_chat" => ScenarioType::PrivateChat,
             "fanout_stress" => ScenarioType::FanoutStress,
@@ -55,7 +56,15 @@ impl ScenarioConfig {
             // （connect + token authenticate，无 bcrypt）。G8 拆两场景，见各自 run_*。
             "auth_peak" | "auth_peak_login" => ScenarioType::AuthPeak,
             "reconnect_token_peak" => ScenarioType::ReconnectTokenPeak,
-            _ => ScenarioType::GroupBroadcast,
+            // scenario typo 同样 fail-fast（与未知 protocol 一致），不静默跑错场景。
+            other => {
+                eprintln!(
+                    "[load] FATAL: unknown scenario type {other:?} — expected one of group_broadcast|\
+                     friend_flow|private_chat|fanout_stress|mixed|semantic_verify|backpressure|\
+                     auth_peak|auth_peak_login|reconnect_token_peak"
+                );
+                std::process::exit(1);
+            }
         }
     }
 }
