@@ -531,7 +531,7 @@ fn jittered_delay_ms(i: usize, n: usize, window_ms: u64) -> u64 {
     let window = window_ms as f64;
     let interval = window / n as f64; // 槽间隔
     let nominal = i as f64 * interval; // 第 i 个槽位
-    // hash(i) → [0,1) → [-1,1)，取 ±30%×interval
+                                       // hash(i) → [0,1) → [-1,1)，取 ±30%×interval
     let h = ((i as u64).wrapping_mul(2_654_435_761) % 1000) as f64 / 1000.0;
     let jitter = (h * 2.0 - 1.0) * 0.3 * interval;
     (nominal + jitter).clamp(0.0, window) as u64
@@ -789,7 +789,10 @@ mod tests {
         let (n, window) = (50usize, 5000u64);
         let first = jittered_delay_ms(0, n, window);
         let last = jittered_delay_ms(n - 1, n, window);
-        assert!(first < window / 4, "first arrival should be early, got {first}");
+        assert!(
+            first < window / 4,
+            "first arrival should be early, got {first}"
+        );
         assert!(last > window / 2, "last arrival should be late, got {last}");
     }
 }

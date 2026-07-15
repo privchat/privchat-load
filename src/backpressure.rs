@@ -304,7 +304,10 @@ pub async fn run_backpressure(
     } else if let Some(min_tps) = rate.min_sender_tps {
         report.assert_gte("sender_tps", tps, min_tps);
     } else {
-        report.skip("sender_tps", "smoke profile: min_sender_tps 未配置（gate 才断言 TPS）");
+        report.skip(
+            "sender_tps",
+            "smoke profile: min_sender_tps 未配置（gate 才断言 TPS）",
+        );
     }
 
     Ok(BackpressureResult {
