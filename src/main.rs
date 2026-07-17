@@ -12,6 +12,7 @@ mod config;
 mod scenario;
 mod semantic;
 mod soak;
+mod socket_stall;
 mod user_store;
 
 use assertions::AssertionReport;
@@ -110,6 +111,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         records[0].username, records[0].user_id
     );
     let scenario_type = config.scenario.scenario_type();
+
+    if scenario_type == ScenarioType::Backpressure {
+        // G7 measures server transport/outbox behavior. Keeping local timeline
+        // persistence enabled for every logical client would instead saturate
+        // this single load-generator host with duplicate SQLite writes.
+        privchat_sdk::set_skip_inbound_materialization_for_load_testing(true);
+        warn!("backpressure gate: inbound timeline materialization disabled for load clients");
+    }
 
     // auth_peak manages its own connect cycle; skip pre-building SDKs
     if scenario_type == ScenarioType::AuthPeak {
@@ -211,15 +220,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         return Ok(());
     }
 
-    let (sdks, connect_elapsed_secs) = scenario::create_all_sdks(
-        &records,
-        &data_dir,
-        &config.server.host,
-        config.server.port,
-        &server_protocol,
-        &config.rate,
-    )
-    .await?;
+    let slow_count = (records.len() - 1) / 2;
+    let (sdks, connect_elapsed_secs, stall_proxies) =
+        if scenario_type == ScenarioType::Backpressure && config.run.socket_stall {
+            if server_protocol != "tcp" {
+                return Err("run.socket_stall=true requires [server].protocol=\"tcp\"".into());
+            }
+            let mut sdks = Vec::with_capacity(records.len());
+            let mut proxies = Vec::with_capacity(slow_count);
+            let started = std::time::Instant::now();
+            for (index, record) in records.iter().enumerate() {
+                if index > 0 && index <= slow_count {
+                    let proxy = socket_stall::SocketStallProxy::start(format!(
+                        "{}:{}",
+                        config.server.host, config.server.port
+                    ))
+                    .await?;
+                    let sdk = scenario::create_sdk_for_user(
+                        record,
+                        &data_dir,
+                        "127.0.0.1",
+                        proxy.port(),
+                        "tcp",
+                    )
+                    .await?;
+                    sdks.push(sdk);
+                    proxies.push(proxy);
+                } else {
+                    sdks.push(
+                        scenario::create_sdk_for_user(
+                            record,
+                            &data_dir,
+                            &config.server.host,
+                            config.server.port,
+                            &server_protocol,
+                        )
+                        .await?,
+                    );
+                }
+            }
+            (sdks, started.elapsed().as_secs_f64(), proxies)
+        } else {
+            let (sdks, elapsed) = scenario::create_all_sdks(
+                &records,
+                &data_dir,
+                &config.server.host,
+                config.server.port,
+                &server_protocol,
+                &config.rate,
+            )
+            .await?;
+            (sdks, elapsed, Vec::new())
+        };
 
     let connect_ok = sdks.len();
     let connect_rate = connect_ok as f64 / records.len() as f64;
@@ -263,7 +315,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     } else if scenario_type == ScenarioType::Backpressure {
         // backpressure verification: independent flow
-        let slow_count = (sdks.len() - 1) / 2; // half of bots are slow
         let slow_delay_ms = 500;
         let result = backpressure::run_backpressure(
             &sdks,
@@ -272,6 +323,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.run.duration_sec,
             slow_count.max(1),
             slow_delay_ms,
+            &stall_proxies,
         )
         .await?;
 

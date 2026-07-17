@@ -152,6 +152,9 @@ pub struct RateConfig {
     /// 防止用错 PID 跑 gate 仍假 exit 0。smoke 不设 = false。
     #[serde(default)]
     pub require_server_rss: bool,
+    /// Payload size used by the real socket-stall gate to fill kernel buffers.
+    #[serde(default = "default_message_payload_bytes")]
+    pub message_payload_bytes: usize,
 }
 
 impl Default for RateConfig {
@@ -162,6 +165,7 @@ impl Default for RateConfig {
             msg_per_sec: default_msg_per_sec(),
             min_sender_tps: None,
             require_server_rss: false,
+            message_payload_bytes: default_message_payload_bytes(),
         }
     }
 }
@@ -173,6 +177,10 @@ pub struct RunConfig {
     /// 预热时间（秒），建连完成后等待此时间再开始采集
     #[serde(default = "default_warmup_sec")]
     pub warmup_sec: u64,
+    /// G7 only: authenticate slow clients through a transparent TCP proxy, then
+    /// stop reading their upstream sockets to create real kernel backpressure.
+    #[serde(default)]
+    pub socket_stall: bool,
 }
 
 impl Default for RunConfig {
@@ -180,6 +188,7 @@ impl Default for RunConfig {
         Self {
             duration_sec: default_duration_sec(),
             warmup_sec: default_warmup_sec(),
+            socket_stall: false,
         }
     }
 }
@@ -243,6 +252,9 @@ fn default_protocol() -> String {
 }
 fn default_total() -> u32 {
     100
+}
+fn default_message_payload_bytes() -> usize {
+    256
 }
 fn default_scenario_type() -> String {
     "group_broadcast".to_string()

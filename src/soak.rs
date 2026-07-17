@@ -8,7 +8,7 @@
 //! profile 枚举 fail-fast + 最短时长校验；发送量 ≥ 目标 90%；`msg_per_sec>0`。
 
 use crate::assertions::AssertionReport;
-use crate::scenario::{rpc_call_fire, rpc_call_typed};
+use crate::scenario::{rpc_call_fire, rpc_call_typed, SubmitMessagePayload};
 use crate::user_store::{server_endpoints, UserRecord};
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -30,6 +30,9 @@ use tracing::{info, warn};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SoakProfile {
     Dev,
+    /// Short directional delivery gate. It validates cross-node routing and
+    /// recovery semantics; long-horizon leak assertions remain the 1h/4h gate.
+    CrossNode,
     Smoke,
     Gate1h,
     Gate4h,
@@ -39,17 +42,19 @@ impl SoakProfile {
     pub(crate) fn parse(s: &str) -> Result<Self, String> {
         match s.trim().to_ascii_lowercase().as_str() {
             "" | "dev" => Ok(Self::Dev),
+            "cross_node" | "cross-node" | "crossnode" => Ok(Self::CrossNode),
             "smoke" => Ok(Self::Smoke),
             "gate" | "gate_1h" | "gate1h" => Ok(Self::Gate1h),
             "gate_4h" | "gate4h" => Ok(Self::Gate4h),
             other => Err(format!(
-                "unknown LOAD_TEST_SOAK_PROFILE {other:?} — expected dev|smoke|gate_1h|gate_4h"
+                "unknown LOAD_TEST_SOAK_PROFILE {other:?} — expected dev|cross_node|smoke|gate_1h|gate_4h"
             )),
         }
     }
     fn min_duration_sec(&self) -> u64 {
         match self {
             Self::Dev => 0,
+            Self::CrossNode => 60,
             Self::Smoke => 900,
             Self::Gate1h => 3600,
             Self::Gate4h => 14400,
@@ -58,12 +63,14 @@ impl SoakProfile {
     fn min_warmup_sec(&self) -> u64 {
         match self {
             Self::Dev => 0,
+            Self::CrossNode => 0,
             _ => 600,
         }
     }
     fn rss_net_max_mb(&self) -> f64 {
         match self {
             Self::Dev => 30.0,
+            Self::CrossNode => 30.0,
             Self::Smoke => 40.0,
             Self::Gate1h => 100.0,
             Self::Gate4h => 200.0,
@@ -72,6 +79,7 @@ impl SoakProfile {
     fn rss_tail_slope_max(&self) -> f64 {
         match self {
             Self::Dev => 3.0,
+            Self::CrossNode => 3.0,
             Self::Smoke => 2.0,
             _ => 1.0,
         }
@@ -79,6 +87,7 @@ impl SoakProfile {
     fn fd_net_max(&self) -> f64 {
         match self {
             Self::Dev => 32.0,
+            Self::CrossNode => 32.0,
             Self::Smoke => 40.0,
             _ => 50.0,
         }
@@ -86,12 +95,14 @@ impl SoakProfile {
     fn tokio_task_net_pct_max(&self) -> f64 {
         match self {
             Self::Dev => 0.10,
+            Self::CrossNode => 0.10,
             _ => 0.05,
         }
     }
     fn label(&self) -> &'static str {
         match self {
             Self::Dev => "dev",
+            Self::CrossNode => "cross_node",
             Self::Smoke => "smoke",
             Self::Gate1h => "gate_1h",
             Self::Gate4h => "gate_4h",
@@ -126,6 +137,16 @@ fn rss_mb_of(pid: &str) -> f64 {
 }
 
 fn server_fd_count(pid: &str) -> Option<u64> {
+    // Linux containers expose the authoritative descriptor set directly. This avoids
+    // making the production gate depend on optional diagnostic packages such as lsof.
+    let proc_fd = format!("/proc/{pid}/fd");
+    if Path::new(&proc_fd).exists() {
+        return std::fs::read_dir(proc_fd)
+            .ok()
+            .map(|entries| entries.filter_map(Result::ok).count() as u64);
+    }
+
+    // macOS/local development fallback where procfs is not available.
     let out = std::process::Command::new("lsof")
         .args(["-p", pid])
         .output()
@@ -399,13 +420,28 @@ pub async fn run_soak(
     // === 1. 建 N 个认证连接 ===
     let mut sdks: Vec<Arc<PrivchatSdk>> = Vec::new();
     let mut user_ids: Vec<u64> = Vec::new();
-    for rec in records {
+    let secondary_port = std::env::var("LOAD_TEST_SECONDARY_SERVER_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok());
+    let secondary_host = std::env::var("LOAD_TEST_SECONDARY_SERVER_HOST").ok();
+    let cross_node_mode = secondary_host.is_some();
+    for (index, rec) in records.iter().enumerate() {
+        let target_port = if index > 0 {
+            secondary_port.unwrap_or(server_port)
+        } else {
+            server_port
+        };
+        let target_host = if index > 0 {
+            secondary_host.as_deref().unwrap_or(server_host)
+        } else {
+            server_host
+        };
         match connect_login_auth(
             rec,
             data_dir,
             "soak",
-            server_host,
-            server_port,
+            target_host,
+            target_port,
             server_protocol,
         )
         .await
@@ -615,7 +651,7 @@ pub async fn run_soak(
     let reconn_att = Arc::new(AtomicU64::new(0));
     let probe_init_failed = Arc::new(AtomicBool::new(false));
     let stop = Arc::new(AtomicBool::new(false));
-    let probe = {
+    let mut probe = {
         let mut r = records[0].clone();
         r.device_id = uuid::Uuid::new_v4().to_string();
         let dd = data_dir.to_path_buf();
@@ -677,7 +713,11 @@ pub async fn run_soak(
                     channel_type: 2,
                     last_pts: 0,
                     command_type: "send_message".to_string(),
-                    payload: serde_json::json!({"content": "soak_reconnect_probe", "message_type": 0}),
+                    payload: serde_json::to_value(SubmitMessagePayload {
+                        content: "soak_reconnect_probe".to_string(),
+                        message_type: 0,
+                    })
+                    .expect("typed reconnect payload must serialize"),
                     client_timestamp: chrono::Utc::now().timestamp_millis(),
                     device_id: None,
                 };
@@ -737,18 +777,34 @@ pub async fn run_soak(
                     channel_type: 2,
                     last_pts: observed_pts.load(Ordering::Relaxed),
                     command_type: "send_message".to_string(),
-                    payload: serde_json::json!({"content": content, "message_type": 0}),
+                    payload: serde_json::to_value(SubmitMessagePayload {
+                        content: content.clone(),
+                        message_type: 0,
+                    })
+                    .expect("typed soak payload must serialize"),
                     client_timestamp: chrono::Utc::now().timestamp_millis(),
                     device_id: None,
                 };
-                let sdk = sdks[send_sequence as usize % sdks.len()].clone();
+                // The cross-node gate is directional by design: the primary-node
+                // client sends and the secondary-node client is the independent
+                // realtime recipient. Keeping the recipient read-only avoids
+                // coupling delivery measurement to its local SQLite lookup load.
+                let sender_index = if cross_node_mode {
+                    0
+                } else {
+                    send_sequence as usize % sdks.len()
+                };
+                let sdk = sdks[sender_index].clone();
                 send_sequence += 1;
                 submit_inflight.push(async move {
                     let started = Instant::now();
-                    let result = rpc_call_typed::<_, ClientSubmitResponse>(
-                        &sdk,
-                        routes::sync::SUBMIT,
-                        &req,
+                    let result = tokio::time::timeout(
+                        Duration::from_secs(10),
+                        rpc_call_typed::<_, ClientSubmitResponse>(
+                            &sdk,
+                            routes::sync::SUBMIT,
+                            &req,
+                        ),
                     )
                     .await;
                     (content, t, started.elapsed().as_micros() as u64, result)
@@ -756,7 +812,7 @@ pub async fn run_soak(
             }
             Some((content, t, ack_latency_us, result)) = submit_inflight.next(), if !submit_inflight.is_empty() => {
                 match result {
-                    Ok(response) => {
+                    Ok(Ok(response)) => {
                         observed_pts.fetch_max(response.current_pts, Ordering::Relaxed);
                         sent += 1;
                         if t >= warmup_sec as f64 {
@@ -764,7 +820,7 @@ pub async fn run_soak(
                         }
                         deliver.push((t, ack_latency_us));
                     }
-                    Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         send_err += 1;
                         if let Ok(mut pending) = delivery_pending.lock() {
                             pending.remove(&content);
@@ -792,7 +848,14 @@ pub async fn run_soak(
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let _ = probe.await;
+    if tokio::time::timeout(Duration::from_secs(10), &mut probe)
+        .await
+        .is_err()
+    {
+        warn!("[soak] reconnect probe shutdown timed out; aborting probe task");
+        probe.abort();
+        let _ = probe.await;
+    }
     // Drain event-to-message correlation without blocking the broadcast
     // receiver. A long run can have a small SQLite lookup backlog even though
     // TimelineUpdated arrived on time; cap the drain so a real loss still
@@ -841,7 +904,11 @@ pub async fn run_soak(
         .iter()
         .filter(|(t, ..)| *t >= warmup_sec as f64)
         .collect();
-    let need_min = if profile == SoakProfile::Dev { 3 } else { 6 };
+    let need_min = if matches!(profile, SoakProfile::Dev | SoakProfile::CrossNode) {
+        3
+    } else {
+        6
+    };
     if steady.len() < need_min {
         report.fail(
             "soak_steady_samples",
@@ -852,48 +919,64 @@ pub async fn run_soak(
         }
         return Ok(SoakResult { report });
     }
-    let s_ts: Vec<f64> = steady.iter().map(|s| s.0).collect();
-    let s_rss: Vec<f64> = steady.iter().map(|s| s.1).collect();
-
-    // RSS 净增长 + 末段趋平（§3.1「末 30min」：稳态跨度≥30min 即取固定末 30min，否则末 ½）
-    let rss_net = net_delta(&s_rss);
-    report.assert_lte("soak_rss_net_growth_mb", rss_net, profile.rss_net_max_mb());
-    let span = s_ts.last().unwrap() - s_ts.first().unwrap();
-    let tail_window = if span >= 1800.0 { 1800.0 } else { span / 2.0 };
-    let tail_start = s_ts.last().unwrap() - tail_window;
-    let tail_ts: Vec<f64> = s_ts.iter().cloned().filter(|t| *t >= tail_start).collect();
-    let tail_rss: Vec<f64> = steady
-        .iter()
-        .filter(|s| s.0 >= tail_start)
-        .map(|s| s.1)
-        .collect();
-    let tail_slope = linreg_slope(&tail_ts, &tail_rss) * 60.0;
-    report.assert_lte(
-        "soak_rss_tail_slope_mb_per_min",
-        tail_slope,
-        profile.rss_tail_slope_max(),
-    );
-
-    // FD 净增长
-    let s_fd: Vec<f64> = steady
-        .iter()
-        .filter_map(|s| s.2.map(|v| v as f64))
-        .collect();
-    if s_fd.len() >= need_min {
-        report.assert_lte("soak_fd_net_growth", net_delta(&s_fd), profile.fd_net_max());
+    let mut rss_net = 0.0;
+    let mut tail_slope = 0.0;
+    let mut task_net_pct = 0.0;
+    if profile == SoakProfile::CrossNode {
+        // Startup allocation and maintenance-task scheduling dominate a 60s
+        // directional cross-node run. Leak assertions require the dedicated
+        // 1h/4h profiles, while this profile owns routing correctness only.
+        report.skip("soak_rss_net_growth_mb", "cross_node uses gate_1h/gate_4h");
+        report.skip(
+            "soak_rss_tail_slope_mb_per_min",
+            "cross_node uses gate_1h/gate_4h",
+        );
+        report.skip("soak_fd_net_growth", "cross_node uses gate_1h/gate_4h");
+        report.skip("soak_tokio_task_net_pct", "cross_node uses gate_1h/gate_4h");
     } else {
-        report.fail("soak_fd_net_growth", "稳态 FD 样本不足");
-    }
+        let s_ts: Vec<f64> = steady.iter().map(|s| s.0).collect();
+        let s_rss: Vec<f64> = steady.iter().map(|s| s.1).collect();
 
-    // tokio task 净增 < 5% 基线
-    let s_tasks: Vec<f64> = steady.iter().map(|s| s.3).collect();
-    let task_base = s_tasks.first().copied().unwrap_or(0.0).max(1.0);
-    let task_net_pct = net_delta(&s_tasks) / task_base;
-    report.assert_lte(
-        "soak_tokio_task_net_pct",
-        task_net_pct,
-        profile.tokio_task_net_pct_max(),
-    );
+        // RSS 净增长 + 末段趋平（§3.1「末 30min」：稳态跨度≥30min 即取固定末 30min，否则末 ½）
+        rss_net = net_delta(&s_rss);
+        report.assert_lte("soak_rss_net_growth_mb", rss_net, profile.rss_net_max_mb());
+        let span = s_ts.last().unwrap() - s_ts.first().unwrap();
+        let tail_window = if span >= 1800.0 { 1800.0 } else { span / 2.0 };
+        let tail_start = s_ts.last().unwrap() - tail_window;
+        let tail_ts: Vec<f64> = s_ts.iter().cloned().filter(|t| *t >= tail_start).collect();
+        let tail_rss: Vec<f64> = steady
+            .iter()
+            .filter(|s| s.0 >= tail_start)
+            .map(|s| s.1)
+            .collect();
+        tail_slope = linreg_slope(&tail_ts, &tail_rss) * 60.0;
+        report.assert_lte(
+            "soak_rss_tail_slope_mb_per_min",
+            tail_slope,
+            profile.rss_tail_slope_max(),
+        );
+
+        // FD 净增长
+        let s_fd: Vec<f64> = steady
+            .iter()
+            .filter_map(|s| s.2.map(|v| v as f64))
+            .collect();
+        if s_fd.len() >= need_min {
+            report.assert_lte("soak_fd_net_growth", net_delta(&s_fd), profile.fd_net_max());
+        } else {
+            report.fail("soak_fd_net_growth", "稳态 FD 样本不足");
+        }
+
+        // tokio task 净增 < 5% 基线
+        let s_tasks: Vec<f64> = steady.iter().map(|s| s.3).collect();
+        let task_base = s_tasks.first().copied().unwrap_or(0.0).max(1.0);
+        task_net_pct = net_delta(&s_tasks) / task_base;
+        report.assert_lte(
+            "soak_tokio_task_net_pct",
+            task_net_pct,
+            profile.tokio_task_net_pct_max(),
+        );
+    }
 
     // RPC 真错误率（**稳态段** Δerror/(Δok+Δerror)，作用域=RPC dispatch，code!=0 计 error）。
     // 基线取 warmup 结束点（steady_rpc_base），排除连接/登录/建群初始化期。

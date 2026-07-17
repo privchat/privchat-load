@@ -11,18 +11,87 @@
 
 use crate::assertions::AssertionReport;
 use crate::config::RateConfig;
-use crate::scenario::{rpc_call_fire, rpc_call_typed};
+use crate::scenario::{rpc_call_fire, rpc_call_typed, SubmitMessagePayload};
+use crate::socket_stall::SocketStallProxy;
 use crate::user_store::UserRecord;
+use futures::{stream::FuturesUnordered, StreamExt};
 use hdrhistogram::Histogram;
 use privchat_protocol::rpc::group::group::{GroupCreateRequest, GroupCreateResponse};
 use privchat_protocol::rpc::group::member::GroupMemberAddRequest;
 use privchat_protocol::rpc::routes;
 use privchat_protocol::rpc::sync::ClientSubmitRequest;
 use privchat_sdk::{PrivchatSdk, SdkEvent};
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{interval, sleep};
 use tracing::{info, warn};
+
+fn pressure_payload(sequence: u64, target_bytes: usize) -> String {
+    let prefix = format!("bp_msg_{sequence}:");
+    let mut bytes = prefix.into_bytes();
+    let mut state = sequence ^ 0x9e37_79b9_7f4a_7c15;
+    while bytes.len() < target_bytes {
+        // Deterministic printable xorshift stream avoids transport compression
+        // masking the kernel-level socket stall under test.
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        bytes.push(33 + (state % 90) as u8);
+    }
+    String::from_utf8(bytes).expect("printable pressure payload")
+}
+
+fn sender_inflight_limit(sender_count: usize) -> usize {
+    // Each SDK actor serializes RPC commands. Queueing more than one request per
+    // actor only measures load-generator queue dwell, not server response time.
+    sender_count.max(1)
+}
+
+async fn submit_timed(
+    sender_index: usize,
+    sdk: Arc<PrivchatSdk>,
+    request: ClientSubmitRequest,
+) -> (
+    usize,
+    Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    Duration,
+) {
+    let started = Instant::now();
+    let result = rpc_call_fire(&sdk, routes::sync::SUBMIT, &request).await;
+    (sender_index, result, started.elapsed())
+}
+
+type SubmitResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+type PendingSubmit = Pin<Box<dyn Future<Output = (usize, SubmitResult, Duration)> + Send>>;
+
+fn record_submit_result(
+    result: SubmitResult,
+    elapsed: Duration,
+    messages_sent: &mut u64,
+    total_errors: &mut u64,
+    latency_hist: &mut Histogram<u64>,
+) {
+    match result {
+        Ok(()) => {
+            *messages_sent += 1;
+            let _ = latency_hist.record(elapsed.as_micros() as u64);
+        }
+        Err(error) => {
+            *total_errors += 1;
+            if *total_errors <= 10 {
+                warn!(
+                    error_index = *total_errors,
+                    elapsed_ms = elapsed.as_millis() as u64,
+                    %error,
+                    "[backpressure] sender RPC failed"
+                );
+            }
+        }
+    }
+}
 
 /// RSS 采样目标：设 `LOAD_TEST_SERVER_PID=<pid>` → 测**服务端**进程（REVIEW_CHECKLIST §B 的
 /// server RSS 门禁需要此项）；不设 → 测 load 工具自身（仅参考，**非 §B 门禁**）。
@@ -48,6 +117,27 @@ fn rss_bytes() -> u64 {
 
 fn rss_mb() -> f64 {
     rss_bytes() as f64 / (1024.0 * 1024.0)
+}
+
+async fn delivery_failure_metric() -> Option<f64> {
+    let url = std::env::var("LOAD_TEST_METRICS_URL").ok()?;
+    let text = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .ok()?
+        .get(url)
+        .send()
+        .await
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    Some(
+        text.lines()
+            .filter(|line| line.starts_with("privchat_delivery_failure_sessions_total{"))
+            .filter_map(|line| line.rsplit('}').next()?.trim().parse::<f64>().ok())
+            .sum(),
+    )
 }
 
 /// 生成 local_message_id
@@ -80,9 +170,15 @@ pub async fn run_backpressure(
     duration_sec: u64,
     slow_count: usize,
     slow_delay_ms: u64,
+    stall_proxies: &[SocketStallProxy],
 ) -> Result<BackpressureResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut report = AssertionReport::new();
     let mut total_errors = 0u64;
+    let delivery_failure_start = if stall_proxies.is_empty() {
+        None
+    } else {
+        delivery_failure_metric().await
+    };
 
     if sdks.len() < 2 || records.len() < 2 {
         report.skip("backpressure", "at least 2 users required");
@@ -100,6 +196,25 @@ pub async fn run_backpressure(
     let bot_sdks = &sdks[1..];
     let bot_user_ids: Vec<u64> = records[1..].iter().map(|r| r.user_id).collect();
     let actual_slow_count = slow_count.min(bot_sdks.len()).max(1);
+    // A load process is not 100 physical phones: keeping every fast member online
+    // would materialize each group push into dozens of SQLite databases on the same
+    // four CPUs and benchmark the generator instead of the server. Twelve independent
+    // authenticated senders exceed the 50 TPS gate while the full 100-member recipient
+    // snapshot is still exercised (unused members take the durable offline path).
+    // Seven concurrent actors sustain the >=50 TPS gate while avoiding an
+    // artificial twelve-deep queue on the channel's intentionally serialized
+    // PTS row. The target rate remains 200 TPS and all 100 recipients remain in
+    // the commit-time snapshot, so this does not reduce delivery pressure.
+    const MAX_SENDER_CONNECTIONS: usize = 7;
+    let sender_sdks: Vec<Arc<PrivchatSdk>> = std::iter::once(Arc::clone(main_sdk))
+        .chain(
+            bot_sdks
+                .iter()
+                .skip(actual_slow_count)
+                .take(MAX_SENDER_CONNECTIONS - 1)
+                .cloned(),
+        )
+        .collect();
 
     info!(
         "[backpressure] bots={}, slow={}, slow_delay={}ms, duration={}s",
@@ -136,6 +251,56 @@ pub async fn run_backpressure(
         }
     }
 
+    let unused_fast_start = actual_slow_count + sender_sdks.len().saturating_sub(1);
+    for sdk in bot_sdks.iter().skip(unused_fast_start) {
+        if let Err(error) = sdk.disconnect().await {
+            warn!("[backpressure] disconnect unused fast client failed: {error}");
+            total_errors += 1;
+        }
+    }
+    info!(
+        "[backpressure] disconnected {} unused fast clients; {} sender connections remain",
+        bot_sdks.len().saturating_sub(unused_fast_start),
+        sender_sdks.len()
+    );
+
+    let frozen_read_baseline = if !stall_proxies.is_empty() {
+        let accepted = stall_proxies
+            .iter()
+            .filter(|proxy| proxy.is_accepted())
+            .count();
+        report.assert_gte(
+            "socket_stall_authenticated_connections",
+            accepted as f64,
+            stall_proxies.len() as f64,
+        );
+        let pre_stall_bytes: u64 = stall_proxies
+            .iter()
+            .map(|proxy| proxy.upstream_bytes())
+            .sum();
+        report.assert_gte("socket_stall_pre_auth_bytes", pre_stall_bytes as f64, 1.0);
+        for proxy in stall_proxies {
+            proxy.activate();
+        }
+        // The proxy deliberately keeps its authenticated upstream socket open after
+        // the client side closes. Explicitly disconnect the corresponding SDK actors
+        // so the load generator does not spend the gate retrying into a proxy that no
+        // longer accepts connections; only the frozen server sockets remain under test.
+        for sdk in bot_sdks.iter().take(actual_slow_count) {
+            if let Err(error) = sdk.disconnect().await {
+                warn!("[backpressure] stop slow-client reconnect failed: {error}");
+                total_errors += 1;
+            }
+        }
+        info!(
+            "[backpressure] froze {} authenticated server->client TCP read sides",
+            stall_proxies.len()
+        );
+        Some(pre_stall_bytes)
+    } else {
+        None
+    };
+
     // === Step 3: 启动慢消费者 ===
     info!(
         "[backpressure] starting {} slow consumers (delay={}ms)",
@@ -171,9 +336,18 @@ pub async fn run_backpressure(
     let rss_start = rss_mb();
     info!("[backpressure] RSS start: {:.1} MB", rss_start);
 
-    // === Step 5: 主账号按速率发消息 ===
+    // === Step 5: 快连接池按目标速率发消息 ===
+    // A single SDK actor intentionally serializes RPC commands. Distribute the
+    // gate load over authenticated non-stalled members so the harness can apply
+    // the configured server-side rate instead of measuring one actor's ceiling.
+    info!(
+        "[backpressure] using {} non-stalled sender connections",
+        sender_sdks.len()
+    );
     let mut latency_hist: Histogram<u64> = Histogram::new_with_max(60_000_000, 3).unwrap();
     let mut messages_sent = 0u64;
+    let mut last_progress_report = 0u64;
+    let mut messages_issued = 0u64;
 
     let msg_interval = if rate.msg_per_sec > 0 {
         Duration::from_secs_f64(1.0 / rate.msg_per_sec as f64)
@@ -183,40 +357,82 @@ pub async fn run_backpressure(
     let mut tick = interval(msg_interval);
     tick.tick().await;
 
+    let max_in_flight = sender_inflight_limit(sender_sdks.len());
     let deadline = Instant::now() + Duration::from_secs(duration_sec);
+    let mut pending: FuturesUnordered<PendingSubmit> = FuturesUnordered::new();
+    let mut available_senders: VecDeque<usize> = (0..sender_sdks.len()).collect();
     while Instant::now() < deadline {
         tick.tick().await;
-        let t0 = Instant::now();
+
+        // A sender becomes eligible only after its previous RPC completes. A
+        // global in-flight bound alone is insufficient: round-robin assignment
+        // can queue multiple requests behind one temporarily slower SDK actor.
+        while available_senders.is_empty() {
+            if let Some((sender_index, result, elapsed)) = pending.next().await {
+                available_senders.push_back(sender_index);
+                record_submit_result(
+                    result,
+                    elapsed,
+                    &mut messages_sent,
+                    &mut total_errors,
+                    &mut latency_hist,
+                );
+            }
+        }
+
+        let sender_index = available_senders
+            .pop_front()
+            .expect("sender pool is non-empty after completion wait");
+        let content = pressure_payload(messages_issued, rate.message_payload_bytes);
         let req = ClientSubmitRequest {
             local_message_id: next_local_message_id(),
             channel_id: group_id,
             channel_type: 2,
             last_pts: 0,
             command_type: "send_message".to_string(),
-            payload: serde_json::json!({
-                "content": format!("bp_msg_{}", messages_sent),
-                "message_type": 0
-            }),
+            payload: serde_json::to_value(SubmitMessagePayload {
+                content,
+                message_type: 0,
+            })?,
             client_timestamp: chrono::Utc::now().timestamp_millis(),
             device_id: None,
         };
-        match rpc_call_fire(main_sdk, routes::sync::SUBMIT, &req).await {
-            Ok(_) => {
-                messages_sent += 1;
-                let latency_us = (t0.elapsed().as_secs_f64() * 1_000_000.0) as u64;
-                let _ = latency_hist.record(latency_us);
+        let sdk = Arc::clone(&sender_sdks[sender_index]);
+        pending.push(Box::pin(submit_timed(sender_index, sdk, req)));
+        messages_issued += 1;
+
+        while pending.len() >= max_in_flight {
+            if let Some((sender_index, result, elapsed)) = pending.next().await {
+                available_senders.push_back(sender_index);
+                record_submit_result(
+                    result,
+                    elapsed,
+                    &mut messages_sent,
+                    &mut total_errors,
+                    &mut latency_hist,
+                );
             }
-            Err(_) => total_errors += 1,
         }
 
         // 每 100 条消息采集一次 RSS
-        if messages_sent % 100 == 0 {
+        if messages_sent >= last_progress_report + 100 {
+            last_progress_report = messages_sent;
             let rss_now = rss_mb();
             info!(
                 "[backpressure] progress: sent={} errors={} rss={:.1}MB",
                 messages_sent, total_errors, rss_now
             );
         }
+    }
+
+    while let Some((_sender_index, result, elapsed)) = pending.next().await {
+        record_submit_result(
+            result,
+            elapsed,
+            &mut messages_sent,
+            &mut total_errors,
+            &mut latency_hist,
+        );
     }
 
     // === Step 6: 采集 RSS 结束值 ===
@@ -243,6 +459,26 @@ pub async fn run_backpressure(
         0.0
     };
     let rss_growth_mb = rss_end - rss_start;
+
+    if let Some(frozen_read_baseline) = frozen_read_baseline {
+        let frozen_bytes: u64 = stall_proxies
+            .iter()
+            .map(|proxy| proxy.upstream_bytes())
+            .sum();
+        let bytes_read_after_freeze = frozen_bytes.saturating_sub(frozen_read_baseline);
+        report.assert_gte("socket_stall_connections", stall_proxies.len() as f64, 1.0);
+        report.assert_lte(
+            "socket_stall_upstream_reads_after_freeze",
+            bytes_read_after_freeze as f64,
+            (16 * 1024 * stall_proxies.len()) as f64,
+        );
+        match (delivery_failure_start, delivery_failure_metric().await) {
+            (Some(start), Some(end)) => {
+                report.assert_gte("server_delivery_failure_delta", end - start, 1.0)
+            }
+            _ => report.assert_gte("server_delivery_failure_metric_available", 0.0, 1.0),
+        }
+    }
 
     info!(
         "[backpressure] result: sent={} errors={} p50={:.2}ms p99={:.2}ms mean={:.2}ms rss_growth={:.1}MB",
@@ -318,4 +554,26 @@ pub async fn run_backpressure(
         rss_start_mb: rss_start,
         rss_end_mb: rss_end,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pressure_payload, sender_inflight_limit};
+
+    #[test]
+    fn pressure_payload_is_exact_and_sequence_specific() {
+        let first = pressure_payload(1, 4096);
+        let second = pressure_payload(2, 4096);
+        assert_eq!(first.len(), 4096);
+        assert_eq!(second.len(), 4096);
+        assert_ne!(first, second);
+        assert!(first.bytes().all(|byte| byte.is_ascii_graphic()));
+    }
+
+    #[test]
+    fn in_flight_requests_are_bounded_to_one_per_serial_sdk_actor() {
+        assert_eq!(sender_inflight_limit(0), 1);
+        assert_eq!(sender_inflight_limit(1), 1);
+        assert_eq!(sender_inflight_limit(12), 12);
+    }
 }

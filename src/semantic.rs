@@ -135,10 +135,10 @@ pub async fn run_semantic_verify(
             channel_type: 2, // group
             last_pts: truth_set.last().map(|e| e.pts).unwrap_or(0),
             command_type: "send_message".to_string(),
-            payload: serde_json::json!({
-                "content": content,
-                "message_type": 0
-            }),
+            payload: serde_json::to_value(crate::scenario::SubmitMessagePayload {
+                content,
+                message_type: 0,
+            })?,
             client_timestamp: chrono::Utc::now().timestamp_millis(),
             device_id: None,
         };

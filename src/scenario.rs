@@ -241,6 +241,12 @@ fn next_local_message_id() -> u64 {
     (ts << 16) | (seq & 0xFFFF)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct SubmitMessagePayload {
+    pub content: String,
+    pub message_type: u8,
+}
+
 /// 通过 sync/submit 发送一条群消息
 async fn send_group_message(
     sdk: &PrivchatSdk,
@@ -253,10 +259,10 @@ async fn send_group_message(
         channel_type: 2, // group
         last_pts: 0,
         command_type: "send_message".to_string(),
-        payload: serde_json::json!({
-            "content": content,
-            "message_type": 0
-        }),
+        payload: serde_json::to_value(SubmitMessagePayload {
+            content: content.to_string(),
+            message_type: 0,
+        })?,
         client_timestamp: chrono::Utc::now().timestamp_millis(),
         device_id: None,
     };
