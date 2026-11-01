@@ -111,6 +111,7 @@ async fn connect_and_auth_one(
         endpoints,
         connection_timeout_secs: 30,
         data_dir: user_data_dir.to_string_lossy().to_string(),
+        spki_pins: Vec::new(),
     };
 
     let t0 = Instant::now();
@@ -457,6 +458,7 @@ async fn warmup_login_one(
         endpoints,
         connection_timeout_secs: 30,
         data_dir: user_data_dir.to_string_lossy().to_string(),
+        spki_pins: Vec::new(),
     };
     let sdk = PrivchatSdk::new(config);
     sdk.connect().await?;
@@ -492,6 +494,7 @@ async fn connect_and_token_auth_one(
         endpoints,
         connection_timeout_secs: 30,
         data_dir: user_data_dir.to_string_lossy().to_string(),
+        spki_pins: Vec::new(),
     };
     let t0 = Instant::now();
     let sdk = PrivchatSdk::new(config);

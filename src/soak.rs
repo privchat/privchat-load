@@ -288,6 +288,7 @@ async fn connect_login_auth(
         endpoints,
         connection_timeout_secs: 30,
         data_dir: dir.to_string_lossy().to_string(),
+        spki_pins: Vec::new(),
     };
     let sdk = PrivchatSdk::new(config);
     sdk.connect().await?;

@@ -58,6 +58,7 @@ pub async fn create_sdk_for_user(
         endpoints,
         connection_timeout_secs: 30,
         data_dir: user_data_dir.to_string_lossy().to_string(),
+        spki_pins: Vec::new(),
     };
 
     let sdk = PrivchatSdk::new(config);
@@ -413,6 +414,7 @@ pub async fn run_friend_flow(
             source: Some("search".to_string()),
             source_id: Some(searched_user.search_session_id.to_string()),
             from_user_id: 0, // server-filled
+            grant_id: None,
         };
         if let Err(e) = rpc_call_fire(&main_sdk, routes::friend::APPLY, &apply_req).await {
             warn!(
