@@ -36,6 +36,48 @@ impl UserRecord {
     }
 }
 
+/// Device-id contract: a random UUID v4 (RFC 4122 variant), lowercase hyphenated.
+/// The servers reject anything else, so every simulated device must carry one.
+pub fn is_canonical_device_id(value: &str) -> bool {
+    match uuid::Uuid::parse_str(value) {
+        Ok(id) => {
+            id.get_version_num() == 4
+                && id.get_variant() == uuid::Variant::RFC4122
+                && id.hyphenated().to_string() == value
+        }
+        Err(_) => false,
+    }
+}
+
+/// Replace every stored device id that is not a canonical v4 with a fresh random v4.
+/// Returns true when at least one record was changed (caller must persist).
+fn repair_device_ids(records: &mut [UserRecord]) -> bool {
+    let mut changed = false;
+    for record in records.iter_mut() {
+        if !is_canonical_device_id(&record.device_id) {
+            record.device_id = uuid::Uuid::new_v4().to_string();
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Rewrite users.txt with the given records (used after device-id repair).
+fn rewrite_users(
+    users_file: &Path,
+    records: &[UserRecord],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut body = String::new();
+    for record in records {
+        body.push_str(&record.to_line());
+        body.push('\n');
+    }
+    let tmp = users_file.with_extension("txt.tmp");
+    std::fs::write(&tmp, body)?;
+    std::fs::rename(&tmp, users_file)?;
+    Ok(())
+}
+
 /// 从 users.txt 加载所有记录
 pub fn load_users(
     users_file: &Path,
@@ -134,6 +176,12 @@ pub async fn ensure_users(
     std::fs::create_dir_all(&users_root)?;
 
     let mut records = load_users(users_file)?;
+    // Stored ids from older runs may predate the strict v4 contract; replace them once
+    // and persist so each simulated device keeps a stable id across runs.
+    if repair_device_ids(&mut records) {
+        rewrite_users(users_file, &records)?;
+        info!("🔧 已将 users.txt 中不合规的 device_id 替换为 UUID v4");
+    }
     let need = total as usize;
     if records.len() >= need {
         info!("📋 已有 {} 个账号，满足需要 {}", records.len(), need);
@@ -163,6 +211,7 @@ pub async fn ensure_users(
             endpoints: endpoints.clone(),
             connection_timeout_secs: 30,
             data_dir: user_data_dir.to_string_lossy().to_string(),
+            spki_pins: Vec::new(),
         };
 
         let sdk = PrivchatSdk::new(config);
@@ -191,4 +240,40 @@ pub async fn ensure_users(
     }
 
     Ok(records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(device_id: &str) -> UserRecord {
+        UserRecord {
+            username: "u".to_string(),
+            device_id: device_id.to_string(),
+            token: "t".to_string(),
+            user_id: 1,
+        }
+    }
+
+    #[test]
+    fn canonical_device_id_accepts_only_lowercase_v4() {
+        let v4 = uuid::Uuid::new_v4().to_string();
+        assert!(is_canonical_device_id(&v4));
+        assert!(!is_canonical_device_id(&v4.to_uppercase()));
+        assert!(!is_canonical_device_id(&v4.replace('-', "")));
+        assert!(!is_canonical_device_id(""));
+        assert!(!is_canonical_device_id("dev-1"));
+        let v5 = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_DNS, b"x").to_string();
+        assert!(!is_canonical_device_id(&v5));
+    }
+
+    #[test]
+    fn repair_replaces_only_invalid_ids() {
+        let good = uuid::Uuid::new_v4().to_string();
+        let mut records = vec![record(&good), record("loadtest-device-1")];
+        assert!(repair_device_ids(&mut records));
+        assert_eq!(records[0].device_id, good);
+        assert!(is_canonical_device_id(&records[1].device_id));
+        assert!(!repair_device_ids(&mut records));
+    }
 }
