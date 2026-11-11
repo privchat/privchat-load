@@ -67,6 +67,8 @@ privchat-load/
 | `LOAD_TEST_METRICS_URL` | - | Prometheus metrics URL（auth_peak 用） |
 | `LOAD_TEST_PROTOCOL` | 配置文件值 | 临时强制单协议：`quic` / `tcp` / `websocket` |
 | `LOAD_TEST_QUIC_ACCEPT_SELF_SIGNED` | `auto` | 强制控制 QUIC 自签证书：`1` 开启，`0` 关闭 |
+| `LOAD_TEST_SERVER_CERT` | - | 服务端证书 PEM 路径，自动推导 SPKI pin（TCP/QUIC 必需，SDK 缺 pin 拒连） |
+| `LOAD_TEST_SPKI_PIN` | - | 显式 SPKI pin（base64 SHA-256，逗号分隔）；优先于 `LOAD_TEST_SERVER_CERT` |
 
 ## 场景
 

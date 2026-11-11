@@ -317,3 +317,43 @@ fn env_bool(key: &str) -> Option<bool> {
 fn is_local_host(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "localhost" | "::1" | "0.0.0.0")
 }
+
+/// 服务端身份 SPKI pin（base64 SHA-256，QUIC 与 TLS/TCP 共用）。
+///
+/// SDK 对缺 pin 的 TCP/QUIC 连接直接拒绝（防 MITM），压测客户端必须和生产客户端
+/// 一样携带真实服务端身份：
+/// - `LOAD_TEST_SPKI_PIN=<base64>[,<base64>...]`：显式 pin 列表；
+/// - `LOAD_TEST_SERVER_CERT=<path.pem>`：从服务端证书推导 pin（推荐）；
+/// - 都不设 → 空（WebSocket 场景不受影响；TCP/QUIC 会被 SDK 明确拒绝）。
+pub fn transport_spki_pins() -> Vec<String> {
+    if let Ok(pins) = std::env::var("LOAD_TEST_SPKI_PIN") {
+        let list: Vec<String> = pins
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !list.is_empty() {
+            return list;
+        }
+    }
+    if let Ok(path) = std::env::var("LOAD_TEST_SERVER_CERT") {
+        let pem = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("LOAD_TEST_SERVER_CERT 读取失败 {path}: {e}"));
+        let der = pem_first_cert_der(&pem)
+            .unwrap_or_else(|| panic!("LOAD_TEST_SERVER_CERT 无 CERTIFICATE 块: {path}"));
+        let pin = msgtrans::spki_sha256_base64(&der)
+            .unwrap_or_else(|e| panic!("SPKI 推导失败: {e}"));
+        return vec![pin];
+    }
+    Vec::new()
+}
+
+fn pem_first_cert_der(pem: &str) -> Option<Vec<u8>> {
+    use base64::Engine;
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    let start = pem.find(BEGIN)? + BEGIN.len();
+    let end = pem[start..].find(END)? + start;
+    let b64: String = pem[start..end].chars().filter(|c| !c.is_whitespace()).collect();
+    base64::engine::general_purpose::STANDARD.decode(b64).ok()
+}

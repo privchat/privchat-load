@@ -81,6 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("duration: {} sec", config.run.duration_sec);
     info!("warmup: {} sec", config.run.warmup_sec);
     info!("env: {:?}", env);
+    let pins = config::transport_spki_pins();
+    info!(
+        "transport SPKI pins: {} (LOAD_TEST_SPKI_PIN / LOAD_TEST_SERVER_CERT)",
+        if pins.is_empty() { "none — TCP/QUIC will be rejected by SDK".to_string() } else { pins.join(",") }
+    );
 
     if config.server.allow_self_signed_quic() {
         privchat_sdk::set_quic_accept_self_signed_for_testing(true);

@@ -58,7 +58,7 @@ pub async fn create_sdk_for_user(
         endpoints,
         connection_timeout_secs: 30,
         data_dir: user_data_dir.to_string_lossy().to_string(),
-        spki_pins: Vec::new(),
+        spki_pins: crate::config::transport_spki_pins(),
     };
 
     let sdk = PrivchatSdk::new(config);
