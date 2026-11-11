@@ -127,6 +127,22 @@ cargo run --release -- --config test_c.conf   # 50 用户
 | `peak_success_rate` | >= 90% |
 | `peak_auth_p99_ms` | <= 5000ms |
 
+### Scenario D: 拉黑端到端验证 (`blacklist_e2e`)
+
+协议级验证拉黑拦截与解除恢复（P0-3），并并入 QR 扫码入群 21001 守卫验证（P0-1 遗留）。自管连接周期，不复用预建 SDK。
+
+流程：A/B 结为好友 → direct 双向基线发送 + `get_difference` 投递 → B 拉黑 A → **A 发断言 `20402`、B 发断言 `20403`**（好友状态下拉黑仍须拦截，BLACKLIST_SPEC §5）→ check/list 单向 → 解除 → 双向恢复。QR 阶段：补注册 C → DB 置 `user_type=1` → C 首次 login → A 建群取 qr_key → C 扫码入群断言 `21001` + B 扫码阳性对照。
+
+```bash
+# 需 LOAD_TEST_DATABASE_URL（QR 阶段把 C 提升为 system user；缺省则 QR 整段 SKIP）
+LOAD_TEST_USER_PREFIX=r3bl \
+LOAD_TEST_SERVER_CERT=../privchat-server/certs/server.crt \
+LOAD_TEST_DATABASE_URL="$BETA_DB_URL" \
+cargo run --release -- --config test_blacklist_e2e.conf
+```
+
+发送走 `sync/submit`（与 wire 共用 `authorize_send_to_channel`），错误码经 `Error::Server{code}` 断言。23 项断言全过为 PASS。
+
 ### 标准场景
 
 | 场景 | `scenario.type` | 说明 |

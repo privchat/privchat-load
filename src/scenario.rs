@@ -479,7 +479,8 @@ pub async fn run_scenario(
         | ScenarioType::Backpressure
         | ScenarioType::AuthPeak
         | ScenarioType::ReconnectTokenPeak
-        | ScenarioType::Soak => {
+        | ScenarioType::Soak
+        | ScenarioType::BlacklistE2e => {
             // Handled separately in main.rs
             Ok(ScenarioStats::default())
         }

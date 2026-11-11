@@ -105,12 +105,13 @@ impl ScenarioConfig {
             "auth_peak" | "auth_peak_login" => ScenarioType::AuthPeak,
             "reconnect_token_peak" => ScenarioType::ReconnectTokenPeak,
             "soak" => ScenarioType::Soak,
+            "blacklist_e2e" => ScenarioType::BlacklistE2e,
             // scenario typo 同样 fail-fast（与未知 protocol 一致），不静默跑错场景。
             other => {
                 eprintln!(
                     "[load] FATAL: unknown scenario type {other:?} — expected one of group_broadcast|\
                      friend_flow|private_chat|fanout_stress|mixed|semantic_verify|backpressure|\
-                     auth_peak|auth_peak_login|reconnect_token_peak"
+                     auth_peak|auth_peak_login|reconnect_token_peak|soak|blacklist_e2e"
                 );
                 std::process::exit(1);
             }
@@ -133,6 +134,9 @@ pub enum ScenarioType {
     ReconnectTokenPeak,
     /// G10 soak：长时持续负载检测 server RSS/FD 无持续单调上涨（泄漏）。
     Soak,
+    /// P0-3 拉黑两账号 E2E：好友状态下拉黑双向拦截（20402/20403）+ 解除恢复，
+    /// 附带 P0-1 遗留 QR 扫码入群 21001 协议级验证（需 LOAD_TEST_DATABASE_URL）。
+    BlacklistE2e,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -8,6 +8,7 @@
 mod assertions;
 mod auth_peak;
 mod backpressure;
+mod blacklist_e2e;
 mod config;
 mod scenario;
 mod semantic;
@@ -216,6 +217,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
         println!("\n============ soak result ============");
         println!("=====================================\n");
+        let report = result.report;
+        report.print();
+        if !report.all_passed() {
+            eprintln!("{} assertions failed, exit code 1", report.fail_count());
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // blacklist_e2e（P0-3）：自管连接周期。QR 阶段须在账号 C 首次 login 前把
+    // user_type 置 1（避免陈旧缓存），因此不复用预建 SDK，跳过 create_all_sdks。
+    if scenario_type == ScenarioType::BlacklistE2e {
+        let result = blacklist_e2e::run_blacklist_e2e(
+            &records,
+            &data_dir,
+            &users_file,
+            &config.server.host,
+            config.server.port,
+            &server_protocol,
+            &password,
+        )
+        .await?;
         let report = result.report;
         report.print();
         if !report.all_passed() {

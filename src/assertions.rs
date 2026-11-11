@@ -72,6 +72,20 @@ impl AssertionReport {
         });
     }
 
+    /// 布尔断言：协议级 E2E 用（错误码/状态判定），actual/expected 原样记录便于取证。
+    pub fn check(&mut self, name: &str, ok: bool, actual: &str, expected: &str) {
+        self.results.push(AssertionResult {
+            name: name.to_string(),
+            status: if ok {
+                AssertionStatus::Pass
+            } else {
+                AssertionStatus::Fail
+            },
+            actual: actual.to_string(),
+            threshold: expected.to_string(),
+        });
+    }
+
     /// 显式硬失败（无阈值语义，用于「前置条件不满足即 FAIL」，如无效 server PID）。
     pub fn fail(&mut self, name: &str, reason: &str) {
         self.results.push(AssertionResult {
